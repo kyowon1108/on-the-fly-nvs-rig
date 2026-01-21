@@ -63,6 +63,86 @@ def get_lapla_norm(img, kernel):
     return F.conv2d(laplacian_norm, kernel, padding="same")[0, 0].clamp(0, 1)
 
 
+def compute_frequency_score(image: torch.Tensor, threshold: float = 0.01) -> float:
+    """
+    Compute frequency content score for an image (0.0 ~ 1.0).
+
+    Based on paper Section 3.3: frequency-based optimization scheduling.
+    - High score: high-frequency regions (edges, details)
+    - Low score: low-frequency regions (smooth areas)
+
+    Args:
+        image: Image tensor of shape [C, H, W] or [H, W] on CUDA
+        threshold: Normalization threshold for Laplacian variance
+
+    Returns:
+        Frequency score between 0.0 and 1.0
+    """
+    # Ensure image is on CUDA and has proper shape
+    if image.dim() == 2:
+        image = image.unsqueeze(0)
+    if image.dim() == 3:
+        # Convert to grayscale if RGB
+        if image.shape[0] == 3:
+            gray = 0.299 * image[0] + 0.587 * image[1] + 0.114 * image[2]
+        else:
+            gray = image[0]
+    else:
+        raise ValueError(f"Expected 2D or 3D tensor, got {image.dim()}D")
+
+    # Compute Laplacian
+    laplacian_kernel = torch.tensor(
+        [[0, 1, 0], [1, -4, 1], [0, 1, 0]],
+        device=image.device,
+        dtype=torch.float32
+    ).unsqueeze(0).unsqueeze(0)
+
+    gray_4d = gray.unsqueeze(0).unsqueeze(0)
+    laplacian = F.conv2d(gray_4d, laplacian_kernel, padding="same")
+
+    # Compute variance of Laplacian as frequency score
+    # Higher variance = more high-frequency content
+    score = laplacian.var().item()
+
+    # Normalize to 0~1 range
+    score = min(1.0, score / threshold)
+    return score
+
+
+def compute_adaptive_iterations(
+    image: torch.Tensor,
+    base_iters: int = 30,
+    min_iters: int = 15,
+    max_iters: int = 45,
+    alpha: float = 1.0
+) -> int:
+    """
+    Compute adaptive iteration count based on frequency score.
+
+    Based on paper Section 3.3: frequency-based optimization scheduling.
+    High-frequency regions get more iterations, low-frequency regions get fewer.
+
+    Formula: iters = base + alpha * (freq_score - 0.5) * base
+    - freq_score=0.5 → base_iters (30)
+    - freq_score=1.0 → max_iters (45)
+    - freq_score=0.0 → min_iters (15)
+
+    Args:
+        image: Image tensor of shape [C, H, W]
+        base_iters: Base number of iterations
+        min_iters: Minimum iterations for low-frequency keyframes
+        max_iters: Maximum iterations for high-frequency keyframes
+        alpha: Scheduler sensitivity (0.5-2.0 recommended)
+
+    Returns:
+        Adaptive iteration count
+    """
+    freq_score = compute_frequency_score(image)
+
+    # Linear mapping based on frequency score
+    iters = base_iters + int(alpha * (freq_score - 0.5) * base_iters)
+    return max(min_iters, min(max_iters, iters))
+
 
 def increment_runtime(runtime, start_time):
     # torch.cuda.synchronize()

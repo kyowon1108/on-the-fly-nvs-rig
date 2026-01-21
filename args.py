@@ -56,8 +56,16 @@ def get_args():
         
     ## Training schedule and losses
     parser.add_argument('--lambda_dssim', type=float, default=0.2, help="Weight for DSSIM loss")
-    parser.add_argument('--num_iterations', type=int, default=30, 
+    parser.add_argument('--num_iterations', type=int, default=30,
                         help="Number of training iterations per keyframe")
+    parser.add_argument('--use_frequency_scheduler', action='store_true',
+                        help="Enable frequency-based adaptive iteration scheduling (paper Section 3.3)")
+    parser.add_argument('--freq_min_iters', type=int, default=15,
+                        help="Minimum iterations for low-frequency keyframes")
+    parser.add_argument('--freq_max_iters', type=int, default=45,
+                        help="Maximum iterations for high-frequency keyframes")
+    parser.add_argument('--freq_alpha', type=float, default=1.0,
+                        help="Frequency scheduler sensitivity (0.5-2.0 recommended)")
     parser.add_argument('--depth_loss_weight_init', type=float, default=1e-2)
     parser.add_argument('--depth_loss_weight_decay', type=float, default=0.9, 
                         help="Weight decay for depth loss, multiply depth loss weight by this factor every iterations")

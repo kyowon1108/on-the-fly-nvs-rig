@@ -33,7 +33,7 @@ from scene.scene_model import SceneModel
 from gaussianviewer import GaussianViewer
 from webviewer.webviewer import WebViewer
 from graphdecoviewer.types import ViewerMode
-from utils import align_mean_up_fwd, increment_runtime
+from utils import align_mean_up_fwd, increment_runtime, compute_adaptive_iterations
 
 if __name__ == "__main__":
     torch.random.manual_seed(0)
@@ -193,12 +193,28 @@ if __name__ == "__main__":
                     scene_model.add_new_gaussians(index)
                     increment_runtime(runtimes["Init"], start_time)
                 start_time = time.time()
+                # Compute adaptive iterations based on frequency content (paper Section 3.3)
+                if args.use_frequency_scheduler:
+                    # Use average iterations across bootstrap keyframes
+                    adaptive_iters_list = [
+                        compute_adaptive_iterations(
+                            kf_dict["image"],
+                            args.num_iterations,
+                            args.freq_min_iters,
+                            args.freq_max_iters,
+                            args.freq_alpha
+                        )
+                        for kf_dict in bootstrap_keyframe_dicts
+                    ]
+                    num_iters = int(np.mean(adaptive_iters_list))
+                else:
+                    num_iters = args.num_iterations
                 # Run initial optimization on the bootstrap keyframes
                 # If streaming, run async optimization until the next keyframe is added
                 if is_stream:
-                    scene_model.optimize_async(args.num_iterations)
+                    scene_model.optimize_async(num_iters)
                 else:
-                    scene_model.optimization_loop(args.num_iterations)
+                    scene_model.optimization_loop(num_iters)
                 increment_runtime(runtimes["Opt"], start_time)
                 last_reboot = n_keyframes
 
@@ -286,11 +302,22 @@ if __name__ == "__main__":
                     scene_model.add_new_gaussians()
                     increment_runtime(runtimes["Init"], start_time)
                     start_time = time.time()
+                    # Compute adaptive iterations based on frequency content (paper Section 3.3)
+                    if args.use_frequency_scheduler:
+                        num_iters = compute_adaptive_iterations(
+                            image,
+                            args.num_iterations,
+                            args.freq_min_iters,
+                            args.freq_max_iters,
+                            args.freq_alpha
+                        )
+                    else:
+                        num_iters = args.num_iterations
                     # If streaming, run async optimization until the next keyframe is added
                     if is_stream:
-                        scene_model.optimize_async(args.num_iterations)
+                        scene_model.optimize_async(num_iters)
                     else:
-                        scene_model.optimization_loop(args.num_iterations)
+                        scene_model.optimization_loop(num_iters)
                     increment_runtime(runtimes["Opt"], start_time)
                 else:
                     should_add_keyframe = False
