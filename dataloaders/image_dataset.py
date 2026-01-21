@@ -107,7 +107,8 @@ class ImageDataset:
     def __getitem__(self, index):
         image_path = self.image_paths[index]
         image = self._load_image(image_path, cv2.IMREAD_UNCHANGED)
-        info = self.infos[os.path.basename(image_path)]
+        # Multi-camera rig support: use image_name_list which contains relative paths
+        info = self.infos[self.image_name_list[index]]
         if image.shape[0] == 4:
             info["mask"] = image[-1][None].cpu()
             image = image[:3]
@@ -162,20 +163,37 @@ class ImageDataset:
                 f" Failed to read COLMAP files in {colmap_folder_path}: {e}"
             )
             return
-        if len(cameras) != 1:
-            logging.warning(" Only supports one camera")
-        model = list(cameras.values())[0].model
-        if model != "PINHOLE" and model != "SIMPLE_PINHOLE":
-            logging.warning(" Unexpected camera model: " + model)
+
+        # Multi-camera rig support: log number of cameras instead of warning
+        if len(cameras) > 1:
+            logging.info(f" Loaded {len(cameras)} cameras (multi-camera rig mode)")
+
+        # Validate camera models
+        for cam_id, camera in cameras.items():
+            if camera.model != "PINHOLE" and camera.model != "SIMPLE_PINHOLE":
+                logging.warning(f" Camera {cam_id}: Unexpected camera model: {camera.model}")
 
         for image_id, image in images.items():
             camera = cameras[image.camera_id]
 
-            # Intrinsics and projection matrix
-            focal_x = camera.params[0]
-            focal_y = camera.params[1] if camera.model == "PINHOLE" else focal_x
-            focal = (focal_x + focal_y) / 2
-            focal = focal_x * self.width / camera.width
+            # Intrinsics: scale to current image size
+            scale = self.width / camera.width
+
+            # Extract fx, fy, cx, cy based on camera model
+            if camera.model == "PINHOLE":
+                # PINHOLE: fx, fy, cx, cy
+                fx = camera.params[0] * scale
+                fy = camera.params[1] * scale
+                cx = camera.params[2] * scale
+                cy = camera.params[3] * scale
+            else:  # SIMPLE_PINHOLE: f, cx, cy
+                fx = camera.params[0] * scale
+                fy = fx
+                cx = camera.params[1] * scale
+                cy = camera.params[2] * scale
+
+            # For backward compatibility, also store focal as average
+            focal = (fx + fy) / 2
 
             # Pose
             Rt = np.eye(4, dtype=np.float32)
@@ -183,10 +201,26 @@ class ImageDataset:
             Rt[:3, 3] = image.tvec
 
             # Store CameraInfo for each image
-            name = os.path.basename(image.name)
-            if image.name in self.infos:
-                self.infos[name]["Rt"] = torch.tensor(Rt, device="cuda")
-                self.infos[name]["focal"] = torch.tensor([focal], device="cuda").float()
+            # Multi-camera rig support: try both full path and basename for matching
+            name = image.name  # Full path like "High_Cam01/f0361.png"
+            name_basename = os.path.basename(image.name)  # Just "f0361.png"
+
+            # Find matching key in self.infos (could be full path or basename)
+            matched_name = None
+            if name in self.infos:
+                matched_name = name
+            elif name_basename in self.infos:
+                matched_name = name_basename
+
+            if matched_name is not None:
+                self.infos[matched_name]["Rt"] = torch.tensor(Rt, device="cuda")
+                self.infos[matched_name]["focal"] = torch.tensor([focal], device="cuda").float()
+                # Multi-camera rig: store per-image intrinsics
+                self.infos[matched_name]["camera_id"] = image.camera_id
+                self.infos[matched_name]["fx"] = torch.tensor([fx], device="cuda").float()
+                self.infos[matched_name]["fy"] = torch.tensor([fy], device="cuda").float()
+                self.infos[matched_name]["cx"] = torch.tensor([cx], device="cuda").float()
+                self.infos[matched_name]["cy"] = torch.tensor([cy], device="cuda").float()
 
     def align_colmap_poses(self):
         """Scale and set first Rt as identity"""

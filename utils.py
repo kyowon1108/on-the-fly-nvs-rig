@@ -21,11 +21,22 @@ def parse_time(seconds):
     return time.strftime("%H:%M:%S", time.gmtime(seconds))
 
 def get_image_names(in_folder, image_extensions=[".jpg", ".png", ".jpeg"]):
-    return [
-        f
-        for f in os.listdir(in_folder)
-        if os.path.splitext(f)[-1].lower() in image_extensions
-    ]
+    """
+    Get image names from a folder. Supports both flat and nested directory structures.
+    For multi-camera rigs, images may be organized in subdirectories (e.g., images_by_camera/Cam01/f0001.png).
+    Returns relative paths from in_folder.
+    """
+    image_names = []
+    for f in os.listdir(in_folder):
+        full_path = os.path.join(in_folder, f)
+        if os.path.isfile(full_path) and os.path.splitext(f)[-1].lower() in image_extensions:
+            image_names.append(f)
+        elif os.path.isdir(full_path):
+            # Recursively search subdirectories (for multi-camera rig support)
+            for sf in os.listdir(full_path):
+                if os.path.splitext(sf)[-1].lower() in image_extensions:
+                    image_names.append(os.path.join(f, sf))
+    return image_names
 
 def psnr(img1, img2):
     return 10 * torch.log10(1 / F.mse_loss(img1, img2)).item()

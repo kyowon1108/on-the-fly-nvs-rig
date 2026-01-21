@@ -453,12 +453,20 @@ class SceneModel:
         """
         Render the scene from a given keyframe id at a specified resolution level (pyr_lvl).
         Applies the exposure matrix of the keyframe to the rendered image.
+        Multi-camera rig support: uses per-keyframe FOV values.
         """
         keyframe = self.keyframes[keyframe_id]
         view_matrix = keyframe.get_Rt().transpose(0, 1)
         scale = 2**pyr_lvl
         width, height = self.width // scale, self.height // scale
-        render_pkg = self.render(width, height, view_matrix, scaling_modifier, bg)
+
+        # Multi-camera rig support: use per-keyframe FOV if available
+        fov_x, fov_y = None, None
+        if hasattr(keyframe, 'fx') and keyframe.fx is not None:
+            fov_x = keyframe.get_fov_x()
+            fov_y = keyframe.get_fov_y()
+
+        render_pkg = self.render(width, height, view_matrix, scaling_modifier, bg, fov_x=fov_x, fov_y=fov_y)
         render_pkg["render"] = (
             keyframe.exposure[:3, :3] @ render_pkg["render"].view(3, -1)
         ) + keyframe.exposure[:3, 3, None]
@@ -724,7 +732,10 @@ class SceneModel:
             accurate_mask = accurate_mask[valid_mask]
 
         # Get the samples' 3D positions
-        new_pts = depth2points(sampled_uv, depth.unsqueeze(-1), self.f, self.centre)
+        # Multi-camera rig support: use per-keyframe intrinsics
+        kf_f = keyframe.f if hasattr(keyframe, 'f') and keyframe.f is not None else self.f
+        kf_centre = keyframe.centre if hasattr(keyframe, 'centre') else self.centre
+        new_pts = depth2points(sampled_uv, depth.unsqueeze(-1), kf_f, kf_centre)
         new_pts = (new_pts - keyframe.get_t()) @ keyframe.get_R()
         # Add points from matching
         match_pts = keyframe.desc_kpts.pts3d[keyframe.desc_kpts.has_pt3d]
@@ -756,7 +767,8 @@ class SceneModel:
         scales = 1 / (torch.sqrt(sampled_init_proba))
         scales.clamp_(1, self.width / 10)
         # Scale by the distance to the camera centre
-        scales.mul_(1 / self.f)
+        # Multi-camera rig support: use per-keyframe focal length
+        scales.mul_(1 / kf_f)
         scales *= torch.linalg.vector_norm(
             new_pts - keyframe.approx_centre[None], dim=-1
         )
@@ -781,6 +793,73 @@ class SceneModel:
         )
         rots = torch.zeros(f_dc.shape[0], 4, device="cuda")
         rots[:, 0] = 1
+
+        ## Inter-camera redundancy removal (multi-camera rig support)
+        # Check if we're in a multi-camera setup by looking at camera_id
+        current_camera_id = getattr(keyframe, 'camera_id', None)
+        if current_camera_id is not None and len(new_pts) > 0 and self.xyz.shape[0] > 0:
+            # Find nearby keyframes from different cameras
+            other_camera_kfs = []
+            for kf in self.keyframes[-20:]:  # Check recent keyframes
+                kf_camera_id = getattr(kf, 'camera_id', None)
+                if kf_camera_id is not None and kf_camera_id != current_camera_id:
+                    # Check if keyframe is close enough (within a distance threshold)
+                    dist_to_current = torch.linalg.norm(kf.approx_centre - keyframe.approx_centre)
+                    if dist_to_current < 1.0:  # Adjust threshold as needed
+                        other_camera_kfs.append(kf)
+
+            if len(other_camera_kfs) > 0:
+                # Check each new point against existing Gaussians via reprojection
+                redundancy_mask = torch.zeros(len(new_pts), dtype=torch.bool, device="cuda")
+                depth_threshold = 0.05  # Relative depth threshold for redundancy
+
+                for other_kf in other_camera_kfs[:3]:  # Limit to 3 other cameras
+                    # Transform new points to other camera's view
+                    other_Rt = other_kf.get_Rt()
+                    pts_in_other = new_pts @ other_Rt[:3, :3].T + other_Rt[:3, 3]
+                    pts_depth = pts_in_other[:, 2]
+
+                    # Project to other camera's image plane
+                    other_f = other_kf.f if hasattr(other_kf, 'f') and other_kf.f is not None else self.f
+                    other_centre = other_kf.centre if hasattr(other_kf, 'centre') else self.centre
+
+                    # Check if points are in front of camera and within image bounds
+                    valid_depth = pts_depth > 0.01
+                    pts_uv = pts_in_other[:, :2] / pts_depth.unsqueeze(-1).clamp_min(0.01)
+                    pts_uv = pts_uv * other_f + other_centre
+
+                    in_bounds = (pts_uv[:, 0] >= 0) & (pts_uv[:, 0] < self.width) & \
+                                (pts_uv[:, 1] >= 0) & (pts_uv[:, 1] < self.height)
+                    valid_pts = valid_depth & in_bounds
+
+                    if valid_pts.any():
+                        # Render depth from other camera
+                        try:
+                            other_render_pkg = self.render_from_id(other_kf.index)
+                            other_rendered_depth = 1 / other_render_pkg["invdepth"][0].clamp_min(1e-8)
+
+                            # Sample rendered depth at projected positions
+                            valid_uv = pts_uv[valid_pts].long()
+                            valid_uv[:, 0] = valid_uv[:, 0].clamp(0, self.width - 1)
+                            valid_uv[:, 1] = valid_uv[:, 1].clamp(0, self.height - 1)
+                            sampled_depth = other_rendered_depth[valid_uv[:, 1], valid_uv[:, 0]]
+
+                            # Check for redundancy: if depth is similar, mark as redundant
+                            depth_diff = torch.abs(pts_depth[valid_pts] - sampled_depth) / sampled_depth.clamp_min(0.01)
+                            redundant = depth_diff < depth_threshold
+                            redundancy_mask[valid_pts] = redundancy_mask[valid_pts] | redundant
+                        except Exception:
+                            pass  # Skip if rendering fails
+
+                # Remove redundant new Gaussians
+                if redundancy_mask.any():
+                    keep_mask = ~redundancy_mask
+                    new_pts = new_pts[keep_mask]
+                    f_dc = f_dc[keep_mask]
+                    f_rest = f_rest[keep_mask]
+                    opacities = opacities[keep_mask]
+                    scales = scales[keep_mask]
+                    rots = rots[keep_mask]
 
         ## Get which Gaussians should be pruned
         if self.xyz.shape[0] > 0:

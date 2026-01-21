@@ -40,6 +40,12 @@ class Keyframe:
         triangulator: Triangulator,
         args: Namespace,
         inference_mode: bool = False,
+        # Multi-camera rig support: per-camera intrinsics
+        fx: torch.Tensor = None,
+        fy: torch.Tensor = None,
+        cx: torch.Tensor = None,
+        cy: torch.Tensor = None,
+        camera_id: int = None,
     ):
         self.image_pyr = [image]
         if not inference_mode: # Only extract depth and feature maps in training mode
@@ -47,10 +53,26 @@ class Keyframe:
             self.mono_idepth, self.mono_depth_conf = depth_estimator(image)
             self.width = image.shape[2]
             self.height = image.shape[1]
-            self.centre = torch.tensor(
-                [(self.width - 1) / 2, (self.height - 1) / 2], device="cuda"
-            )
-            self.f = f
+
+            # Multi-camera rig support: use per-camera intrinsics if provided
+            self.camera_id = camera_id
+            if fx is not None and fy is not None and cx is not None and cy is not None:
+                self.fx = fx
+                self.fy = fy
+                self.cx = cx
+                self.cy = cy
+                self.centre = torch.tensor([cx.item(), cy.item()], device="cuda")
+                self.f = (fx + fy) / 2  # Average focal for backward compatibility
+            else:
+                self.centre = torch.tensor(
+                    [(self.width - 1) / 2, (self.height - 1) / 2], device="cuda"
+                )
+                self.f = f
+                self.fx = f
+                self.fy = f
+                self.cx = torch.tensor([(self.width - 1) / 2], device="cuda")
+                self.cy = torch.tensor([(self.height - 1) / 2], device="cuda")
+
             self.triangulator = triangulator
             self.depth_loss_weight = args.depth_loss_weight_init
             self.depth_loss_weight_decay = args.depth_loss_weight_decay
@@ -268,6 +290,18 @@ class Keyframe:
                     self.idepth_pyr.pop()
                 self.pyr_lvl -= 1
 
+    def get_fov_x(self) -> float:
+        """Get horizontal field of view for this keyframe's camera."""
+        import math
+        fx = self.fx.item() if hasattr(self.fx, 'item') else self.fx
+        return 2 * math.atan(self.width / (2 * fx))
+
+    def get_fov_y(self) -> float:
+        """Get vertical field of view for this keyframe's camera."""
+        import math
+        fy = self.fy.item() if hasattr(self.fy, 'item') else self.fy
+        return 2 * math.atan(self.height / (2 * fy))
+
     def to_json(self):
         info = {
             "is_test": self.info["is_test"],
@@ -277,11 +311,25 @@ class Keyframe:
         if "Rt" in self.info:
             info["gt_Rt"] = self.info["Rt"].cpu().numpy().tolist()
 
-        return {
+        result = {
             "info": info,
             "Rt": self.get_Rt().detach().cpu().numpy().tolist(),
-            "f": self.f.item(),
+            "f": self.f.item() if hasattr(self.f, 'item') else self.f,
         }
+
+        # Multi-camera rig support: save per-camera intrinsics
+        if hasattr(self, 'fx') and self.fx is not None:
+            result["fx"] = self.fx.item() if hasattr(self.fx, 'item') else self.fx
+        if hasattr(self, 'fy') and self.fy is not None:
+            result["fy"] = self.fy.item() if hasattr(self.fy, 'item') else self.fy
+        if hasattr(self, 'cx') and self.cx is not None:
+            result["cx"] = self.cx.item() if hasattr(self.cx, 'item') else self.cx
+        if hasattr(self, 'cy') and self.cy is not None:
+            result["cy"] = self.cy.item() if hasattr(self.cy, 'item') else self.cy
+        if hasattr(self, 'camera_id') and self.camera_id is not None:
+            result["camera_id"] = self.camera_id
+
+        return result
 
     @classmethod
     def from_json(cls, config, index, height, width):
@@ -293,7 +341,7 @@ class Keyframe:
             desc_kpts=None,
             Rt=torch.tensor(config["Rt"]).cuda(),
             index=index,
-            f=None, 
+            f=None,
             feat_extractor=None,
             depth_estimator=None,
             triangulator=None,
@@ -302,28 +350,61 @@ class Keyframe:
         )
         keyframe.height = height
         keyframe.width = width
-        keyframe.centre = torch.tensor(
-            [(width - 1) / 2, (height - 1) / 2], device="cuda"
-        )
+
+        # Multi-camera rig support: load per-camera intrinsics if available
+        if "fx" in config and "fy" in config and "cx" in config and "cy" in config:
+            keyframe.fx = torch.tensor([config["fx"]], device="cuda").float()
+            keyframe.fy = torch.tensor([config["fy"]], device="cuda").float()
+            keyframe.cx = torch.tensor([config["cx"]], device="cuda").float()
+            keyframe.cy = torch.tensor([config["cy"]], device="cuda").float()
+            keyframe.centre = torch.tensor([config["cx"], config["cy"]], device="cuda")
+            keyframe.f = (keyframe.fx + keyframe.fy) / 2
+        else:
+            keyframe.centre = torch.tensor(
+                [(width - 1) / 2, (height - 1) / 2], device="cuda"
+            )
+            if "f" in config:
+                keyframe.f = torch.tensor([config["f"]], device="cuda").float()
+                keyframe.fx = keyframe.f
+                keyframe.fy = keyframe.f
+                keyframe.cx = torch.tensor([(width - 1) / 2], device="cuda")
+                keyframe.cy = torch.tensor([(height - 1) / 2], device="cuda")
+
+        # Load camera_id if available
+        if "camera_id" in config:
+            keyframe.camera_id = config["camera_id"]
+        else:
+            keyframe.camera_id = None
+
         return keyframe
 
-    def to_colmap(self, id):
+    def to_colmap(self, id, use_original_camera_id: bool = False):
         """
         Convert the keyframe to a colmap camera and image.
+        Multi-camera rig support: output PINHOLE format with 4 parameters (fx, fy, cx, cy).
         """
-        # first param of params is focal length in pixels
+        # Determine camera_id for COLMAP output
+        colmap_camera_id = self.camera_id if (use_original_camera_id and self.camera_id is not None) else id
+
+        # Get intrinsic parameters
+        fx_val = self.fx.item() if hasattr(self.fx, 'item') else self.fx
+        fy_val = self.fy.item() if hasattr(self.fy, 'item') else self.fy
+        cx_val = self.cx.item() if hasattr(self.cx, 'item') else self.centre[0].item()
+        cy_val = self.cy.item() if hasattr(self.cy, 'item') else self.centre[1].item()
+
+        # Use PINHOLE model with 4 parameters (fx, fy, cx, cy)
         camera = Camera(
-            id=id,
-            model="SIMPLE_PINHOLE",
+            id=colmap_camera_id,
+            model="PINHOLE",
             width=self.width,
             height=self.height,
-            params=[self.f.item(), self.centre[0].item(), self.centre[1].item()],
+            params=[fx_val, fy_val, cx_val, cy_val],
         )
 
         image = BaseImage(
             id=id,
             name=self.info.get("name", str(id)),
-            camera_id=id,
+            camera_id=colmap_camera_id,
             qvec=-rotmat2qvec(self.get_R().cpu().detach().numpy()),
             tvec=self.get_t().flatten().cpu().detach().numpy(),
             xys=[],

@@ -160,6 +160,12 @@ if __name__ == "__main__":
                     if args.use_colmap_poses:
                         Rt = keyframe_dict["info"]["Rt"]
                         f = keyframe_dict["info"]["focal"]
+                    # Multi-camera rig support: extract per-camera intrinsics
+                    fx = keyframe_dict["info"].get("fx", None)
+                    fy = keyframe_dict["info"].get("fy", None)
+                    cx = keyframe_dict["info"].get("cx", None)
+                    cy = keyframe_dict["info"].get("cy", None)
+                    camera_id = keyframe_dict["info"].get("camera_id", None)
                     keyframe = Keyframe(
                         keyframe_dict["image"],
                         keyframe_dict["info"],
@@ -171,6 +177,11 @@ if __name__ == "__main__":
                         depth_estimator,
                         triangulator,
                         args,
+                        fx=fx,
+                        fy=fy,
+                        cx=cx,
+                        cy=cy,
+                        camera_id=camera_id,
                     )
                     scene_model.add_keyframe(keyframe, f)
                     increment_runtime(runtimes["Add"], start_time)
@@ -244,6 +255,12 @@ if __name__ == "__main__":
                 if Rt is not None:
                     if args.use_colmap_poses:
                         Rt = info["Rt"]
+                    # Multi-camera rig support: extract per-camera intrinsics
+                    fx = info.get("fx", None)
+                    fy = info.get("fy", None)
+                    cx = info.get("cx", None)
+                    cy = info.get("cy", None)
+                    camera_id = info.get("camera_id", None)
                     keyframe = Keyframe(
                         image,
                         info,
@@ -255,6 +272,11 @@ if __name__ == "__main__":
                         depth_estimator,
                         triangulator,
                         args,
+                        fx=fx,
+                        fy=fy,
+                        cx=cx,
+                        cy=cy,
+                        camera_id=camera_id,
                     )
                     scene_model.add_keyframe(keyframe)
                     prev_keyframe = keyframe
