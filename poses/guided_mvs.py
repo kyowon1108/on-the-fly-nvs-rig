@@ -33,6 +33,11 @@ class GuidedMVS():
 
     @torch.no_grad()
     def __call__(self, uv, refKeyframe, keyframes: list):
+        # Kernel is compiled for a fixed NUM_CAMS = n_cams and indexes exactly
+        # that many neighbours; a shorter list reads out of bounds (garbage depth
+        # / crash). Callers must pass >= n_cams (extras are ignored). Fail loud.
+        assert len(keyframes) >= self.n_cams, \
+            f"guided_mvs needs >= {self.n_cams} neighbour keyframes, got {len(keyframes)}"
         uv = uv.contiguous()
         # Get relative poses
         other2ref = [keyframe.get_Rt() @ torch.linalg.inv(refKeyframe.get_Rt()) for keyframe in keyframes]

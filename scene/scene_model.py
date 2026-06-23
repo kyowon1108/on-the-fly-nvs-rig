@@ -763,14 +763,19 @@ class SceneModel:
             if keyframe.index == prev_keyframe.index:
                 prev_KFs.pop(i)
                 break
-        # (rig) same-ts exclusion safety net + empty-pool guard: prev_KFs must
-        # never share this keyframe's rig timestamp (zero baseline -> degenerate
-        # depth), and guided_mvs needs >=1 partner (a B==1 bootstrap could empty it).
+        # (rig) same-ts exclusion safety net: prev_KFs must never share this
+        # keyframe's rig timestamp (zero baseline -> degenerate depth).
         _ex_ts = keyframe.info.get("rig_ts")
         if _ex_ts is not None:
             assert all(p.info.get("rig_ts") != _ex_ts for p in prev_KFs), \
                 "zero-baseline same-ts keyframe leaked into guided_mvs partners"
-        if len(prev_KFs) == 0:
+        # guided_mvs' CUDA kernel is compiled for a fixed NUM_CAMS = n_cams and
+        # indexes exactly that many neighbours: passing FEWER reads out of bounds
+        # (garbage depth / crash). After same-ts/holdout exclusion the cross-ts
+        # pool can fall below n_cams (small bootstrap B, heavy offload) -> skip
+        # spawn for this keyframe rather than feed a short list. (>= n_cams is
+        # fine; the kernel just uses the first n_cams.)
+        if len(prev_KFs) < self.guided_mvs.n_cams:
             return
         depth, accurate_mask = self.guided_mvs(sampled_uv, keyframe, prev_KFs)
         valid_mask = (keyframe.sample_conf(sampled_uv) > 0.5) * (depth > 1e-6)
