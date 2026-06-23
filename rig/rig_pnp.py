@@ -1,4 +1,4 @@
-"""Rig-aware PnP: method A from TODO.md §3.3.2.
+"""Rig-aware PnP (method A).
 
 Each view runs PnP independently, the view poses are lifted to candidate
 rig poses via the known fixed relative transforms, and the candidates are

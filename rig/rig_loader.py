@@ -53,6 +53,9 @@ class RigConfig:
 
 def load_rig_config(config_path: str, ref_view: str = "High_Cam07",
                     device: str = "cpu") -> RigConfig:
+    """Load blender_rig.json -> RigConfig. Flattens ring->camera order into
+    view_names and builds per-view relative_Rt (4x4 world-to-cam, rel_t=0) such
+    that view_w2c = relative_Rt[view] @ rig_w2c, relative to ref_view."""
     with open(config_path, "r", encoding="utf-8") as f:
         rings = json.load(f)
 

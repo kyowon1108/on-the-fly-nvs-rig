@@ -137,6 +137,11 @@ def get_args():
                         help="Rig mode: skip the shared rig-pose photometric step "
                              "(trust pose_initializer PnP/miniBA outputs). Diagnostic; "
                              "rig views stay rigidly co-centered either way.")
+    parser.add_argument('--rig_mono_seed', action='store_true',
+                        help="Rig mode: seed bootstrap 3D points from DA-V2 mono depth "
+                             "(cross-view scale reconciled via align_rig_views). Default "
+                             "OFF = unit-depth, which A/B+GT-ATE showed is >= mono here "
+                             "(bootstrap xyz is discarded; seed only nudges pose-BA).")
 
     ## Checkpoint options
     parser.add_argument('-m', '--model_path', default="", 

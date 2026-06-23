@@ -15,9 +15,8 @@ import math
 from poses.feature_detector import DescribedKeypoints
 from poses.mini_ba import MiniBA
 from poses.mini_ba_rig import MiniBARig
-import os
 from utils import fov2focal, depth2points, sixD2mtx, mtx2sixD, sample
-from scene.mono_depth import relative_idepth_to_depth
+from scene.mono_depth import relative_idepth_to_depth, align_rig_views
 from scene.keyframe import Keyframe
 from poses.ransac import RANSACEstimator, EstimatorType
 from rig.rig_pnp import rig_pnp_per_view
@@ -345,10 +344,17 @@ class PoseInitializer():
         # Pre-convert DA-V2 inverse-depth -> depth per (ts, view) once; the seed
         # loop samples it so wide views start near their true depth, not z=1
         # (roadmap Issue A). None -> original unit-depth behaviour.
+        # Per-ts, reconcile the 9 views' independent DA-V2 scales using their
+        # shared-centre overlap (align_rig_views) so the seed is geometrically
+        # coherent across views (#5). Gauge view = view_names[0]; absolute scale is
+        # re-anchored by the 0.1 normalisation below.
         mono_depth_maps = None
         if mono_idepth_per_ts_per_view is not None:
+            rel_R_dict = {v: rig_config.relative_Rt[v][:3, :3].cuda() for v in view_names}
+            cx, cy = float(self.centre[0]), float(self.centre[1])
             mono_depth_maps = [
-                {v: relative_idepth_to_depth(ts_dict[v]).float() for v in view_names}
+                align_rig_views(ts_dict, rel_R_dict, view_names, view_names[0],
+                                float(self.f_init), cx, cy, self.height, self.width)
                 for ts_dict in mono_idepth_per_ts_per_view
             ]
 

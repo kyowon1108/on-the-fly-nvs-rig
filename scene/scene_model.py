@@ -315,9 +315,10 @@ class SceneModel:
         l1_loss = (image - gt_image).abs().mean()
         ssim_loss = 1 - fused_ssim(image[None], gt_image[None])
         depth_loss = (invdepth - mono_idepth).abs().mean()
-        # NOTE: depth_loss_weight를 0으로 만들지 말 것. mono depth가 절대 scale은
-        # 안 맞아도 ordinal prior로 Gaussian depth ordering을 안정화시키고 있음.
-        # weight=0 → PSNR -0.58, ATE 12-18× 악화 (검증: 2026-04-16, Fix 2 시도).
+        # NOTE: do NOT set depth_loss_weight to 0. Even though mono depth's
+        # absolute scale is off, it acts as an ordinal prior that stabilizes
+        # Gaussian depth ordering. weight=0 -> PSNR -0.58, ATE 12-18x worse
+        # (verified 2026-04-16, "Fix 2" attempt).
         loss = (
             self.lambda_dssim * ssim_loss
             + (1 - self.lambda_dssim) * l1_loss
@@ -648,7 +649,7 @@ class SceneModel:
             candidate_idx = candidate_idx[keep]
 
         # Look for the previous keyframes with the most matches with desc_kpts (if provided)
-        if desc_kpts is not None and len(candidate_idx) > n:
+        if desc_kpts is not None and len(candidate_idx) >= n:
             n_ckecks = min(self.num_prev_keyframes_check, len(candidate_idx))
             keyframes_indices_to_check = candidate_idx[:n_ckecks]
             n_matches = torch.zeros(len(keyframes_indices_to_check), device="cuda")
@@ -762,6 +763,15 @@ class SceneModel:
             if keyframe.index == prev_keyframe.index:
                 prev_KFs.pop(i)
                 break
+        # (rig) same-ts exclusion safety net + empty-pool guard: prev_KFs must
+        # never share this keyframe's rig timestamp (zero baseline -> degenerate
+        # depth), and guided_mvs needs >=1 partner (a B==1 bootstrap could empty it).
+        _ex_ts = keyframe.info.get("rig_ts")
+        if _ex_ts is not None:
+            assert all(p.info.get("rig_ts") != _ex_ts for p in prev_KFs), \
+                "zero-baseline same-ts keyframe leaked into guided_mvs partners"
+        if len(prev_KFs) == 0:
+            return
         depth, accurate_mask = self.guided_mvs(sampled_uv, keyframe, prev_KFs)
         valid_mask = (keyframe.sample_conf(sampled_uv) > 0.5) * (depth > 1e-6)
         sample_mask[sample_mask.clone()] = valid_mask

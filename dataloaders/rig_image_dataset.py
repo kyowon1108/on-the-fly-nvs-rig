@@ -1,12 +1,11 @@
-"""Rig-aware image dataset for 9-view Insta360 X5 rig.
+"""Rig-aware image dataset for the 9-view Insta360 X5 rig.
 
-Pass 1: iterates the reference view only, across all timesteps. This lets the
-existing single-camera bootstrap + incremental pipeline run unchanged and
-produce one rig pose per timestep.
-
-Pass 2: iterates the remaining 8 views. Each frame carries a fixed relative
-transform in its `info` dict; the training loop computes the view pose by
-composing with the stored reference pose of the same timestep (no PnP).
+Each timestep emits one interleaved 9-view batch: the reference view first, then
+the remaining 8 non-ref views in a fixed order (the order they appear in
+`rig_config.view_names`). The training loop pulls a whole timestep at once and
+estimates a single shared rig pose for it; each frame carries its fixed
+`rig_relative_Rt` in `info`, and per-view poses are derived as rel @ rig (no PnP
+per view, rel_t=0). `start_at` is in timestep units (not per-image).
 """
 
 import json

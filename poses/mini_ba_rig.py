@@ -1,4 +1,4 @@
-"""Rig-aware MiniBA (TODO.md §3.3.1).
+"""Rig-aware MiniBA.
 
 Keeps the structure of mini_ba.MiniBA (autograd jacfwd, LM+Schur, CUDA graph)
 but changes the meaning of the "camera" dimension:
@@ -145,9 +145,9 @@ class MiniBARigInternal(nn.Module):
             )
         return torch.ones_like(r)
 
-    def optimize(self, rig_R6D, rig_ts, f, xyz, rel_R, rel_t, centre, uv):
+    def optimize(self, rig_R6D, rig_t, f, xyz, rel_R, rel_t, centre, uv):
         """Run LM iterations. Shapes:
-            rig_R6D: (n_ts, 3, 2)   rig_ts: (n_ts, 3)
+            rig_R6D: (n_ts, 3, 2)   rig_t: (n_ts, 3)
             rel_R: (n_views, 3, 3)  rel_t: (n_views, 3)
             xyz: (npts, 3)          f: (1,)   centre: (2,)
             uv: (npts * n_obs * 2,) flattened.
@@ -157,7 +157,7 @@ class MiniBARigInternal(nn.Module):
         lm = self.lm
 
         for iteration in range(self.iters):
-            rig_R6D_t = torch.cat([rig_R6D.view(-1, 6), rig_ts], dim=-1)  # (n_ts, 9)
+            rig_R6D_t = torch.cat([rig_R6D.view(-1, 6), rig_t], dim=-1)  # (n_ts, 9)
 
             jacobian_elements, r_in = self.get_residual_jacobian(
                 *self.prepare_for_proj(xyz, rig_R6D_t, rel_R, rel_t, f, centre), uv
@@ -247,11 +247,11 @@ class MiniBARigInternal(nn.Module):
             df = dcam[-1] if self.optimize_focal else 0
 
             rig_R6D_tmp = rig_R6D.clone() - dR
-            rig_ts_tmp = rig_ts.clone() - dt
+            rig_t_tmp = rig_t.clone() - dt
             f_tmp = f.clone() - df
             xyz_tmp = xyz - dxyz
 
-            rig_R6D_t_tmp = torch.cat([rig_R6D_tmp.view(-1, 6), rig_ts_tmp], dim=-1)
+            rig_R6D_t_tmp = torch.cat([rig_R6D_tmp.view(-1, 6), rig_t_tmp], dim=-1)
             new_r = self.get_residual(
                 *self.prepare_for_proj(xyz_tmp, rig_R6D_t_tmp, rel_R, rel_t, f_tmp, centre),
                 uv,
@@ -261,22 +261,22 @@ class MiniBARigInternal(nn.Module):
             success_mask = ((new_r ** 2).mean() < (r ** 2).mean()) * (f_tmp > 0)
 
             rig_R6D = rig_R6D - success_mask * dR
-            rig_ts = rig_ts - success_mask * dt
+            rig_t = rig_t - success_mask * dt
             f = f - success_mask * df
             xyz = xyz - success_mask * dxyz
 
-            lm *= (1 / self.k) * success_mask + self.k * (1 - success_mask.to(rig_ts))
+            lm *= (1 / self.k) * success_mask + self.k * (1 - success_mask.to(rig_t))
             rig_R6D = mtx2sixD(sixD2mtx(rig_R6D))
 
-        rig_R6D_t_final = torch.cat([rig_R6D.view(-1, 6), rig_ts], dim=-1)
+        rig_R6D_t_final = torch.cat([rig_R6D.view(-1, 6), rig_t], dim=-1)
         r = self.get_residual(
             *self.prepare_for_proj(xyz, rig_R6D_t_final, rel_R, rel_t, f, centre), uv
         ).view(-1)
         mask = self.get_mask(r, original_mask2)
-        return rig_R6D, rig_ts, f, xyz, r, initial_r, mask
+        return rig_R6D, rig_t, f, xyz, r, initial_r, mask
 
-    def forward(self, rig_R6D, rig_ts, f, xyz, rel_R, rel_t, centre, uv):
-        return self.optimize(rig_R6D, rig_ts, f, xyz, rel_R, rel_t, centre, uv)
+    def forward(self, rig_R6D, rig_t, f, xyz, rel_R, rel_t, centre, uv):
+        return self.optimize(rig_R6D, rig_t, f, xyz, rel_R, rel_t, centre, uv)
 
 
 class MiniBARig:
@@ -305,5 +305,5 @@ class MiniBARig:
         ).eval().cuda()
 
     @torch.no_grad()
-    def __call__(self, rig_R6D, rig_ts, f, xyz, rel_R, rel_t, centre, uv):
-        return self.optimizer(rig_R6D, rig_ts, f, xyz, rel_R, rel_t, centre, uv)
+    def __call__(self, rig_R6D, rig_t, f, xyz, rel_R, rel_t, centre, uv):
+        return self.optimizer(rig_R6D, rig_t, f, xyz, rel_R, rel_t, centre, uv)

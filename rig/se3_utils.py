@@ -127,11 +127,8 @@ def se3_robust_mean(
 ) -> Tensor:
     """IRLS Fréchet mean on SE(3) with a *scale-independent* Huber kernel.
 
-    The previous implementation used `||xi||` where `xi = [ω(rad), u(units)]`,
-    mixing radians and scene units. That threshold was only meaningful when
-    scene translations happened to be comparable to rotation angles.
-
-    This version treats rotation and translation separately:
+    Rotation and translation use separate thresholds (a single ||xi|| over
+    [ω(rad), u(units)] would mix radians with scene units and be meaningless):
       - `rot_dist    = ||ω||`                 (radians)
       - `trans_dist  = ||u|| / scene_scale`   (unit-less)
     and combines them via the tighter Huber weight

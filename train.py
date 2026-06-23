@@ -173,10 +173,13 @@ if __name__ == "__main__":
                 # Pre-compute monocular inverse depth per (ts, view) so the rig
                 # bootstrap seeds 3D points with a geometric prior (DA-V2) instead
                 # of unit depth -> wide views (>90 deg off ref) survive (Issue A).
-                # OTF_NO_MONO_SEED=1 disables the prior (unit-depth seed) to A/B
-                # the mono-seed in isolation; default path uses the DA-V2 prior.
+                # Mono-depth seeding (DA-V2) is OFF by default: A/B + GT-ATE showed
+                # unit-depth >= mono here (bootstrap xyz is discarded, so the seed
+                # only nudges pose-BA convergence -- which unit-depth already does).
+                # --rig_mono_seed re-enables it (uses align_rig_views to reconcile
+                # the per-view DA-V2 scales via shared-centre overlap).
                 mono_idepth_per_ts_per_view = None
-                if not os.environ.get("OTF_NO_MONO_SEED"):
+                if args.rig_mono_seed:
                     mono_idepth_per_ts_per_view = []
                     for data in bootstrap_rig_data:
                         view_dict = {}
@@ -225,7 +228,6 @@ if __name__ == "__main__":
                         if v_name == dataset.ref_view:
                             ref_kf_by_ts[data["ts"]] = kf
                             ref_kf_scene_indices.append(len(scene_model.keyframes) - 1)
-                        prev_keyframe = kf
                         n_keyframes += 1
                 increment_runtime(runtimes["Add"], start_time)
 
@@ -299,7 +301,6 @@ if __name__ == "__main__":
                     dense_extractor, depth_estimator, triangulator, args,
                 )
                 scene_model.add_keyframe(kf)
-                prev_keyframe = kf
                 if v_name == dataset.ref_view:
                     ref_kf_by_ts[ts] = kf
                 # spawn from all 9 views (was: ref only). add_new_gaussians

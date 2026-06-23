@@ -237,7 +237,7 @@ class Keyframe:
             [all_keyframes[index].get_Rt() for i, index in enumerate(chosen_kfs_ids)],
             dim=0,
         )
-        if len(Rts_others < self.triangulator.n_cams):
+        if len(Rts_others) < self.triangulator.n_cams:
             Rts_others = torch.cat(
                 [
                     Rts_others,
