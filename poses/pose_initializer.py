@@ -15,7 +15,9 @@ import math
 from poses.feature_detector import DescribedKeypoints
 from poses.mini_ba import MiniBA
 from poses.mini_ba_rig import MiniBARig
-from utils import fov2focal, depth2points, sixD2mtx, mtx2sixD
+import os
+from utils import fov2focal, depth2points, sixD2mtx, mtx2sixD, sample
+from scene.mono_depth import relative_idepth_to_depth
 from scene.keyframe import Keyframe
 from poses.ransac import RANSACEstimator, EstimatorType
 from rig.rig_pnp import rig_pnp_per_view
@@ -289,7 +291,8 @@ class PoseInitializer():
             return None
 
     @torch.no_grad()
-    def initialize_bootstrap_rig(self, desc_kpts_per_ts_per_view, rig_config):
+    def initialize_bootstrap_rig(self, desc_kpts_per_ts_per_view, rig_config,
+                                 mono_idepth_per_ts_per_view=None):
         """Rig-aware bootstrap (Option A, TODO §3.3.1).
 
         Args:
@@ -339,6 +342,16 @@ class PoseInitializer():
             rig_config.relative_Rt[v][:3, 3].cuda() for v in view_names
         ])
 
+        # Pre-convert DA-V2 inverse-depth -> depth per (ts, view) once; the seed
+        # loop samples it so wide views start near their true depth, not z=1
+        # (roadmap Issue A). None -> original unit-depth behaviour.
+        mono_depth_maps = None
+        if mono_idepth_per_ts_per_view is not None:
+            mono_depth_maps = [
+                {v: relative_idepth_to_depth(ts_dict[v]).float() for v in view_names}
+                for ts_dict in mono_idepth_per_ts_per_view
+            ]
+
         for v_idx, v_name in enumerate(view_names):
             dk_list = per_view_desc_kpts_list[v_name]
             kIDs = [make_kID(v_idx, i) for i in range(N_ts)]
@@ -355,7 +368,15 @@ class PoseInitializer():
                 if ts_hits.numel() == 0:
                     continue
                 ts_idx = int(ts_hits[0].item())
-                local = depth2points(uvs_v[p, ts_idx][None], 1.0, f_init_t, self.centre)[0]
+                uv_pt = uvs_v[p, ts_idx]
+                depth_pt = 1.0
+                if mono_depth_maps is not None:
+                    sampled = sample(mono_depth_maps[ts_idx][v_name],
+                                     uv_pt.view(1, 1, 1, 2), self.width, self.height)
+                    d = float(sampled[0, 0, 0, 0].item())
+                    if d > 0 and math.isfinite(d):
+                        depth_pt = d  # mono-depth seed (else fall back to unit depth)
+                local = depth2points(uv_pt[None], depth_pt, f_init_t, self.centre)[0]
                 xyz_init[lo + p] = rel_R_all[v_idx].T @ local
 
         xyz_init /= xyz_init[..., -1:].clamp_min(1)

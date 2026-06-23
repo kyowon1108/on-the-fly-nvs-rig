@@ -103,6 +103,19 @@ def get_t_s(d):
     return t, s
 
 
+def relative_idepth_to_depth(idepth: torch.Tensor, fallback_depth: float = 1.0) -> torch.Tensor:
+    """DA-V2 returns median/MAD-normalised inverse depth (can be negative; 1/idepth blows
+    up near 0). Shift so the finite min becomes +1.0, then invert -> strictly positive,
+    order-preserving depth. Non-finite entries fall back to fallback_depth. Absolute
+    per-view scale is re-anchored later by bootstrap BA's 0.1 normalisation."""
+    finite_mask = torch.isfinite(idepth)
+    if not finite_mask.any():
+        return torch.full_like(idepth, fallback_depth)
+    idepth_min = idepth[finite_mask].min()
+    depth = 1.0 / (idepth - idepth_min + 1.0)
+    return torch.where(finite_mask, depth, torch.full_like(depth, fallback_depth))
+
+
 def align_samples(tri_idepth: torch.Tensor, mono_idepth: torch.Tensor):
     t_tri, s_tri = get_t_s(tri_idepth)
     t_mono, s_mono = get_t_s(mono_idepth)
