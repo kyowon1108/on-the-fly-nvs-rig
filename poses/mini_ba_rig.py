@@ -31,7 +31,14 @@ def project_rig(xyz, rig_R6D_t, rel_R, rel_t, f, centre):
     view_R = rel_R @ rig_R
     view_t = rel_R @ rig_t + rel_t
     xyz_local = view_R @ xyz + view_t
-    return pts2px(xyz_local, f, centre)
+    # Guard against z<=0 (point behind / at this view's camera). For a wide rig a
+    # point seeded in one view routinely projects behind another view; pts2px would
+    # then divide by ~0 -> inf/NaN. A single such value poisons the BA's robust
+    # threshold (0*inf=NaN in get_mask -> quantile NaN -> every obs masked -> the
+    # bundle becomes a no-op). Clamping z to a small positive depth keeps the
+    # projection finite & large so the (masked) obs is cleanly rejected instead.
+    z = xyz_local[..., 2:3].clamp_min(1e-4)
+    return f * xyz_local[..., :2] / z + centre
 
 
 def get_residual(xyz, rig_R6D_t, rel_R, rel_t, f, centre, uv):
