@@ -166,9 +166,16 @@ class MiniBARigInternal(nn.Module):
             # jacobian_elements[poses] shape: (npts, n_obs, 2, 9) — local Jacobian wrt the
             # rig pose *assigned to this observation's timestep*. We need to place it in
             # the right n_ts-block and zero elsewhere (block-diagonal structure).
-            duv_drig = jacobian_elements[self.param2id["poses"]]
-            duv_drig = duv_drig.unsqueeze(-2).repeat(1, 1, 1, self.n_ts, 1)  # (npts, n_obs, 2, n_ts, 9)
-            duv_drig = torch.where(self._cross_mask, duv_drig, torch.zeros_like(duv_drig))
+            duv_drig = jacobian_elements[self.param2id["poses"]]  # (npts, n_obs, 2, 9)
+            # Block-diagonal placement: observation (ts, view)'s pose-Jacobian belongs
+            # only in rig-block ts. Broadcast the cross-mask against the *unsqueezed*
+            # local Jacobian and fill the off-blocks with a scalar zero, rather than
+            # materialising an n_ts-fold .repeat() AND a zeros_like (two full
+            # (.., n_ts, 9) tensors). The result is identical but transient memory is
+            # ~2.5x lower — which matters as n_views grows (9 -> 12 -> ...).
+            duv_drig = torch.where(
+                self._cross_mask, duv_drig.unsqueeze(-2), duv_drig.new_zeros(())
+            )  # (npts, n_obs, 2, n_ts, 9)
             duv_drig = duv_drig.reshape(*duv_drig.shape[:-2], -1)  # (npts, n_obs, 2, n_ts*9)
 
             if self.optimize_focal:
