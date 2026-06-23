@@ -48,7 +48,7 @@ class Keyframe:
             self.width = image.shape[2]
             self.height = image.shape[1]
             self.centre = torch.tensor(
-                [(self.width - 1) / 2, (self.height - 1) / 2], device="cuda"
+                [self.width / 2, self.height / 2], device="cuda"  # cx=cy=W/2 to match eqr_to_pinhole
             )
             self.f = f
             self.triangulator = triangulator
@@ -303,7 +303,7 @@ class Keyframe:
         keyframe.height = height
         keyframe.width = width
         keyframe.centre = torch.tensor(
-            [(width - 1) / 2, (height - 1) / 2], device="cuda"
+            [width / 2, height / 2], device="cuda"  # cx=cy=W/2 to match eqr_to_pinhole
         )
         return keyframe
 

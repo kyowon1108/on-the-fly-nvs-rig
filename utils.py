@@ -194,7 +194,7 @@ def draw_poses(image, view_matrix, view_fovx, scale, cam_width, cam_height, Rts,
         # Rendering options
         width, height = image.shape[1], image.shape[0]
         f = fov2focal(view_fovx, width)
-        centre = torch.tensor([(width - 1) / 2, (height - 1) / 2], device='cuda')
+        centre = torch.tensor([width / 2, height / 2], device='cuda')  # cx=cy=W/2 to match eqr_to_pinhole
 
         # Camera intrinsics to draw
         cam_centre = torch.tensor([(cam_width - 1) / 2, (cam_height - 1) / 2], device='cuda')
@@ -245,7 +245,7 @@ def draw_anchors(image, view_matrix, view_fovx, scale, anchors, anchor_weights=[
     # Rendering options
     width, height = image.shape[1], image.shape[0]
     f = fov2focal(view_fovx, width)
-    centre = torch.tensor([(width - 1) / 2, (height - 1) / 2], device='cuda')
+    centre = torch.tensor([width / 2, height / 2], device='cuda')  # cx=cy=W/2 to match eqr_to_pinhole
 
     if len(anchors) != len(anchor_weights):
         anchor_weights = np.zeros(len(anchors))

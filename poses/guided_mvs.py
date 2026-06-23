@@ -27,7 +27,7 @@ class GuidedMVS():
         cuda_source = cuda_source.replace("NUM_DEPTH_CANDIDATES", str(num_depth_candidates))
         self.module = cupy.RawModule(
             code=cuda_source, 
-            options=('--std=c++14', '-Iposes'),
+            options=('--std=c++17', '-Iposes'),
         )
         self.uvToDepth = self.module.get_function("uvToDepth")
 

@@ -42,7 +42,7 @@ class RANSACEstimator:
             cuda_source = f.read()
         self.module = cupy.RawModule(
             code=cuda_source,
-            options=("--std=c++14", "-Iposes"),
+            options=("--std=c++17", "-Iposes"),
         )
 
         # Set the functions and number of points required for each estimator

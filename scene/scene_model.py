@@ -73,7 +73,7 @@ class SceneModel:
         self.width = width
         self.height = height
         self.matcher = matcher
-        self.centre = torch.tensor([(width - 1) / 2, (height - 1) / 2], device="cuda")
+        self.centre = torch.tensor([width / 2, height / 2], device="cuda")  # cx=cy=W/2 to match eqr_to_pinhole
         self.anchor_overlap = args.anchor_overlap
         self.optimization_thread = None
 
@@ -302,6 +302,9 @@ class SceneModel:
         l1_loss = (image - gt_image).abs().mean()
         ssim_loss = 1 - fused_ssim(image[None], gt_image[None])
         depth_loss = (invdepth - mono_idepth).abs().mean()
+        # NOTE: depth_loss_weight를 0으로 만들지 말 것. mono depth가 절대 scale은
+        # 안 맞아도 ordinal prior로 Gaussian depth ordering을 안정화시키고 있음.
+        # weight=0 → PSNR -0.58, ATE 12-18× 악화 (검증: 2026-04-16, Fix 2 시도).
         loss = (
             self.lambda_dssim * ssim_loss
             + (1 - self.lambda_dssim) * l1_loss
@@ -320,6 +323,23 @@ class SceneModel:
                 self.optimizer.step(
                     render_pkg["visibility_filter"], render_pkg["radii"].shape[0]
                 )
+
+                # NOTE: raw_scaling.clamp was here but REMOVED.
+                # Clamping scaling created Adam optimizer state mismatch that
+                # paradoxically *caused* the cudaErrorIllegalAddress crash at
+                # iter>=20. Removing it resolved the crash.
+                raw_xyz = self.gaussian_params["xyz"]["val"]
+                if raw_xyz.numel() > 0:
+                    # Scene is at ~0.1-unit scale; 100 is a generous envelope
+                    # that still prevents means2D from overflowing the
+                    # rasterizer's tile arithmetic.
+                    raw_xyz.data.clamp_(min=-100.0, max=100.0)
+                # Guard against stray NaNs from numerically unstable updates.
+                for key in ("xyz", "scaling", "rotation", "opacity", "f_dc"):
+                    if key in self.gaussian_params:
+                        v = self.gaussian_params[key]["val"]
+                        if v.numel() > 0:
+                            torch.nan_to_num_(v.data, nan=0.0, posinf=0.0, neginf=0.0)
 
             keyframe.latest_invdepth = render_pkg["invdepth"].detach()
 
@@ -434,14 +454,14 @@ class SceneModel:
                 image = torch.clamp(render_pkg["render"], 0, 1) * 255
                 image = image.permute(1, 2, 0).cpu().numpy().astype(np.uint8)
                 image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-                is_jpeg = os.path.splitext(keyframe.info["name"])[-1].lower() in [
-                    ".jpg",
-                    ".jpeg",
-                ]
+                # rig mode names are extension-less keys (e.g. "View__ts00001");
+                # fall back to .png so cv2.imwrite has a writer.
+                name = keyframe.info["name"]
+                if not os.path.splitext(name)[-1]:
+                    name = name + ".png"
+                is_jpeg = os.path.splitext(name)[-1].lower() in [".jpg", ".jpeg"]
                 write_flag = [int(cv2.IMWRITE_JPEG_QUALITY), 100] if is_jpeg else []
-                cv2.imwrite(
-                    os.path.join(out_dir, keyframe.info["name"]), image, write_flag
-                )
+                cv2.imwrite(os.path.join(out_dir, name), image, write_flag)
 
     def render_from_id(
         self,
@@ -572,18 +592,32 @@ class SceneModel:
         return closest_anchors, closest_anchors_ids
 
     @torch.no_grad()
-    def get_prev_keyframes(self, n: int, update_3dpts: bool, desc_kpts: DescribedKeypoints = None):
+    def get_prev_keyframes(self, n: int, update_3dpts: bool, desc_kpts: DescribedKeypoints = None, exclude_ts: int = None):
         """
         Get the n previous keyframes that are the closest to the last
         If desc_kpts is not None, we find the previous keyframes that have the most matches with desc_kpts. The search window is given by self.num_prev_keyframes_check
+        If exclude_ts is not None (rig mode), keyframes sharing that rig timestamp are
+        dropped from the candidate pool *before* selection: the N views of one timestep
+        share the rig's optical center (zero baseline), so using them as triangulation/
+        MVS partners yields degenerate depth (conventions §7). They are the nearest
+        neighbours by camera-center distance, so a post-hoc filter would leave none —
+        the exclusion must happen on the candidate pool.
         """
         # Make sure the optimization thread is not running
         self.join_optimization_thread()
 
+        candidate_idx = self.sorted_frame_indices
+        if exclude_ts is not None:
+            keep = torch.tensor(
+                [self.keyframes[int(i)].info.get("rig_ts") != exclude_ts for i in candidate_idx],
+                device=candidate_idx.device,
+            )
+            candidate_idx = candidate_idx[keep]
+
         # Look for the previous keyframes with the most matches with desc_kpts (if provided)
-        if desc_kpts is not None and len(self.keyframes) > n:
-            n_ckecks = min(self.num_prev_keyframes_check, len(self.keyframes))
-            keyframes_indices_to_check = self.sorted_frame_indices[:n_ckecks]
+        if desc_kpts is not None and len(candidate_idx) > n:
+            n_ckecks = min(self.num_prev_keyframes_check, len(candidate_idx))
+            keyframes_indices_to_check = candidate_idx[:n_ckecks]
             n_matches = torch.zeros(len(keyframes_indices_to_check), device="cuda")
             for i, index in enumerate(keyframes_indices_to_check):
                 n_matches[i] = self.matcher.evaluate_match(
@@ -593,7 +627,7 @@ class SceneModel:
             prev_keyframes_indices = keyframes_indices_to_check[top_indices.cpu()]
         # If desc_kpts is not provided, we take the n closest keyframes
         else:
-            prev_keyframes_indices = self.sorted_frame_indices[:n]
+            prev_keyframes_indices = candidate_idx[:n]
         prev_keyframes = [self.keyframes[i] for i in prev_keyframes_indices]
 
         # Re-run triangulation if necessary
@@ -683,7 +717,8 @@ class SceneModel:
         ## Initialize positions
         # Get the samples' depth with guided stereo matching
         prev_KFs = self.get_prev_keyframes(
-            self.guided_mvs.n_cams + 1, update_3dpts=False
+            self.guided_mvs.n_cams + 1, update_3dpts=False,
+            exclude_ts=keyframe.info.get("rig_ts"),
         )
         for i, prev_keyframe in enumerate(prev_KFs):
             if keyframe.index == prev_keyframe.index:
