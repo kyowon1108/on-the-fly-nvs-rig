@@ -92,6 +92,38 @@ class PoseInitializer():
             self._refine_call_count = 0
             self._refine_fail_count = 0
 
+            # Running estimate of inter-frame rig motion (||Δrig_t|| in the
+            # bootstrap-normalized frame). Replaces a hardcoded 0.1 / a
+            # distance-from-origin bound: the robust-mean translation Huber
+            # (rig_pnp) and the refinement divergence gate both want "a typical
+            # inter-frame step", which this adapts to instead of assuming.
+            self._scene_scale_target = 0.1            # bootstrap gauge: median step -> 0.1
+            self._scene_scale_window = 10             # running median over the last N steps
+            self._recent_steps = []
+            self._prev_rig_t = None
+            self._rig_huber_trans = float(getattr(args, "rig_huber_trans", 0.05))
+            self._rig_bootstrap_outlier_dist = float(
+                getattr(args, "rig_bootstrap_outlier_dist", 10.0)
+            )
+
+    def _current_scene_scale(self):
+        """Running median of recent inter-frame ||Δrig_t||; falls back to the
+        bootstrap gauge (0.1) until the first incremental step is recorded."""
+        if self._recent_steps:
+            return float(torch.tensor(self._recent_steps).median())
+        return self._scene_scale_target
+
+    def _update_scene_scale(self, rig_t):
+        """Record this step's inter-frame translation for the running estimate."""
+        rig_t = rig_t.detach().reshape(3)
+        if self._prev_rig_t is not None:
+            step = float((rig_t - self._prev_rig_t).norm())
+            if step > 1e-6:
+                self._recent_steps.append(step)
+                if len(self._recent_steps) > self._scene_scale_window:
+                    self._recent_steps.pop(0)
+        self._prev_rig_t = rig_t.clone()
+
     def build_problem(self,
                       desc_kpts_list: list[DescribedKeypoints],
                       npts: int,
@@ -411,14 +443,19 @@ class PoseInitializer():
         self.f = f_out
         self.intrinsics = torch.cat([f_out, self.centre], dim=0)
 
-        # Scale so consecutive rig centers have median distance 0.1.
+        # Scale so consecutive rig centers have median distance _scene_scale_target.
         # Median is robust to a single bad timestep that bootstrap BA might
         # leave at an outlier position; mean would be dragged by it.
         rel_rig_t = rig_t_out[:-1] - rig_t_out[1:]
         rel_rig_t_med = rel_rig_t.norm(dim=-1).median()
-        scale = 0.1 / rel_rig_t_med.clamp_min(1e-6)
+        scale = self._scene_scale_target / rel_rig_t_med.clamp_min(1e-6)
         rig_t_out = rig_t_out * scale
         xyz_out = xyz_out * scale
+
+        # Seed the running scene-scale from the now-normalized bootstrap steps so the
+        # incremental robust-mean / divergence gate start calibrated (median ~target).
+        self._recent_steps = (rel_rig_t.norm(dim=-1) * scale).detach().tolist()[-self._scene_scale_window:]
+        self._prev_rig_t = rig_t_out[-1].detach().clone()
 
         # Prune BA outlier xyz. The right signal is *reprojection error per
         # point*, not raw distance; far points may still be correct, while
@@ -434,7 +471,7 @@ class PoseInitializer():
         outlier_repr = per_pt_err > 5.0 * per_pt_err_med
         xyz_norm = xyz_out.norm(dim=-1)
         xyz_median = xyz_norm.median().clamp_min(0.01)
-        outlier_dist = xyz_norm > 10.0 * xyz_median
+        outlier_dist = xyz_norm > self._rig_bootstrap_outlier_dist * xyz_median
         outlier_few = mask_view.any(dim=-1).sum(dim=-1) < 2
         outlier_mask = outlier_repr | outlier_dist | outlier_few
         n_outliers = int(outlier_mask.sum().item())
@@ -531,6 +568,8 @@ class PoseInitializer():
             correspondences, rig_config, K,
             min_correspondences=max(self.min_num_inliers // 4, 6),
             reproj_error_px=float(self.max_pnp_error),
+            scene_scale=self._current_scene_scale(),
+            huber_trans=self._rig_huber_trans,
         )
 
         if rig_pose is None:
@@ -557,6 +596,7 @@ class PoseInitializer():
                     f"{self._refine_fail_count}/{self._refine_call_count} "
                     f"({100 * fail_rate:.1f}%)"
                 )
+        self._update_scene_scale(rig_pose[:3, 3])
         return rig_pose, stats
 
     @torch.no_grad()
@@ -616,9 +656,10 @@ class PoseInitializer():
         if not torch.isfinite(t_out).all() or not torch.isfinite(R6D_out).all():
             return rig_pose_init
         t_jump = float((t_out[0] - t_init).norm().item())
-        init_t_norm = float(t_init.norm().item())
-        # Allow refinement to move up to max(0.2, |t_init|)
-        max_jump = max(0.2, init_t_norm * 1.0)
+        # Bound the BA correction to a few inter-frame steps (running scene_scale),
+        # not the absolute |t_init| which grows with orbit radius / distance from the
+        # world origin and would effectively disable this backstop far from origin.
+        max_jump = max(0.2, 3.0 * self._current_scene_scale())
         if t_jump > max_jump:
             return rig_pose_init
 

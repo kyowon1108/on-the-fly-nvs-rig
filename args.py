@@ -149,6 +149,16 @@ def get_args():
                              "(cross-view scale reconciled via align_rig_views). Default "
                              "OFF = unit-depth, which A/B+GT-ATE showed is >= mono here "
                              "(bootstrap xyz is discarded; seed only nudges pose-BA).")
+    parser.add_argument('--rig_huber_trans', type=float, default=0.05,
+                        help="(rig) Robust-mean translation Huber threshold for per-view "
+                             "PnP candidate fusion, in scene_scale-normalized units. A "
+                             "candidate disagreeing by >this fraction of a typical "
+                             "inter-frame step is down-weighted. Lower = anchor harder to "
+                             "the top PnP view; higher = average more views.")
+    parser.add_argument('--rig_bootstrap_outlier_dist', type=float, default=10.0,
+                        help="(rig) Bootstrap 3D-point distance prune: drop points whose "
+                             "norm exceeds this multiple of the median point distance "
+                             "(OR-combined with the reprojection-error prune).")
 
     ## Checkpoint options
     parser.add_argument('-m', '--model_path', default="", 
