@@ -133,6 +133,10 @@ def get_args():
                              "Gaussian optimization but kept for pose estimation and "
                              "post-hoc evaluation. Provides an honest generalization "
                              "metric (avoids the self-render inflation when this is empty).")
+    parser.add_argument('--freeze_rig_poses', action='store_true',
+                        help="Rig mode: skip the shared rig-pose photometric step "
+                             "(trust pose_initializer PnP/miniBA outputs). Diagnostic; "
+                             "rig views stay rigidly co-centered either way.")
 
     ## Checkpoint options
     parser.add_argument('-m', '--model_path', default="", 

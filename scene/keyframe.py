@@ -19,7 +19,7 @@ from poses.triangulator import Triangulator
 from scene.dense_extractor import DenseExtractor
 from scene.mono_depth import MonoDepthEstimator, align_depth
 from scene.optimizers import BaseAdam
-from utils import sample, sixD2mtx, make_torch_sampler, depth2points
+from utils import sample, sixD2mtx, mtx2sixD, make_torch_sampler, depth2points
 from dataloaders.read_write_model import Camera, BaseImage, rotmat2qvec
 
 
@@ -75,9 +75,30 @@ class Keyframe:
         self.info = info
         self.is_test = info["is_test"]
 
+        # RIG MODE: the keyframe pose is DERIVED from the shared per-timestep
+        # rig pose (scene_model.rig_R6D[ts]/rig_t[ts]) on every forward as
+        # view_w2c = rel @ rig — it is NOT an independent nn.Parameter. This keeps
+        # the N views of a timestamp rigidly co-centered (rel_t = 0 EXACTLY)
+        # throughout photometric optimization (the rotation-only rig invariant).
+        # The optimizable rig pose is owned by scene_model.rig_optimizer
+        # (register_rig_poses / append_rig_pose). Per-view independent pose
+        # optimization would let the 9 views drift apart and break the rig.
+        self.rig_view = info.get("rig_view", None)
+        self.ts_idx = info.get("ts_idx", None)
+        self.is_rig_mode = (self.rig_view is not None and self.ts_idx is not None)
+        self.scene_model = None  # back-ref set by scene_model.add_keyframe (rig only)
+
         # Optimizable parameters
-        self.rW2C = torch.nn.Parameter(Rt[:3, :2].clone())
-        self.tW2C = torch.nn.Parameter(Rt[:3, 3].clone())
+        if self.is_rig_mode:
+            # inert plain tensors (the optimizable pose lives in scene_model);
+            # rel_R/rel_t are the FIXED intra-rig extrinsics (rel_t == 0).
+            self.rW2C = Rt[:3, :2].clone()
+            self.tW2C = Rt[:3, 3].clone()
+            self.rel_R = info["rig_relative_Rt"][:3, :3].clone().to("cuda")
+            self.rel_t = info["rig_relative_Rt"][:3, 3].clone().to("cuda")
+        else:
+            self.rW2C = torch.nn.Parameter(Rt[:3, :2].clone())
+            self.tW2C = torch.nn.Parameter(Rt[:3, 3].clone())
         exposure = torch.eye(3, 4, device="cuda")
         self.exposure = torch.nn.Parameter(exposure)
         self.depth_scale = torch.nn.Parameter(torch.ones(1, device="cuda"))
@@ -85,26 +106,21 @@ class Keyframe:
 
         # Optimizer
         if not inference_mode: # Only create optimizer in training mode
-            # Rig holdout: freeze the held-out view's pose at the rig prediction
-            # (rel @ rig_pose) so eval measures novel-view generalisation, not
-            # test-time pose fitting to the held-out GT. Non-rig test frames keep
-            # pose tracking (original OTF protocol).
-            freeze_pose = getattr(args, "use_rig", False) and info["is_test"]
-            if freeze_pose:
-                self.rW2C.requires_grad_(False)
-                self.tW2C.requires_grad_(False)
-            params = {}
-            if not freeze_pose:
+            params = {
+                "depth_scale": {
+                    "val": self.depth_scale,
+                    "lr": args.lr_depth_scale_offset,
+                },
+                "depth_offset": {
+                    "val": self.depth_offset,
+                    "lr": args.lr_depth_scale_offset,
+                },
+            }
+            if not self.is_rig_mode:
+                # rig mode: rW2C/tW2C are inert — the rig pose is optimized by
+                # scene_model.rig_optimizer, so all views move together.
                 params["rW2C"] = {"val": self.rW2C, "lr": args.lr_poses}
                 params["tW2C"] = {"val": self.tW2C, "lr": args.lr_poses}
-            params["depth_scale"] = {
-                "val": self.depth_scale,
-                "lr": args.lr_depth_scale_offset,
-            }
-            params["depth_offset"] = {
-                "val": self.depth_offset,
-                "lr": args.lr_depth_scale_offset,
-            }
             if not info["is_test"]:
                 params["exposure"] = {"val": self.exposure, "lr": args.lr_exposure}
             self.optimizer = BaseAdam(params, betas=(0.8, 0.99))
@@ -132,9 +148,19 @@ class Keyframe:
         return self.image_pyr[0].device
 
     def get_R(self):
+        # Rig mode: derive view rotation from the shared rig pose (gradients
+        # flow into scene_model.rig_R6D[ts], so all views rotate together).
+        if self.is_rig_mode and self.scene_model is not None:
+            rig_R = sixD2mtx(self.scene_model.rig_R6D[self.ts_idx])
+            return self.rel_R @ rig_R
         return sixD2mtx(self.rW2C)
 
     def get_t(self):
+        # Rig mode: view_t = rel_R @ rig_t + rel_t (rel_t == 0). All views of a
+        # timestamp share rig_t → identical optical centre (zero baseline).
+        if self.is_rig_mode and self.scene_model is not None:
+            rig_t = self.scene_model.rig_t[self.ts_idx]
+            return self.rel_R @ rig_t + self.rel_t
         return self.tW2C
 
     def get_Rt(self):
@@ -144,8 +170,18 @@ class Keyframe:
         return Rt
 
     def set_Rt(self, Rt: torch.Tensor):
-        self.rW2C.data.copy_(Rt[:3, :2])
-        self.tW2C.data.copy_(Rt[:3, 3])
+        # Rig mode: invert view_Rt = rel @ rig_Rt to recover the shared rig pose
+        # and write it back (rig_Rt = rel⁻¹ @ view_Rt), keeping all views rigid.
+        if self.is_rig_mode and self.scene_model is not None:
+            rel_R_inv = self.rel_R.T
+            rig_R = rel_R_inv @ Rt[:3, :3]
+            rig_t = rel_R_inv @ (Rt[:3, 3] - self.rel_t)
+            with torch.no_grad():
+                self.scene_model.rig_R6D[self.ts_idx].data.copy_(mtx2sixD(rig_R[None])[0])
+                self.scene_model.rig_t[self.ts_idx].data.copy_(rig_t)
+        else:
+            self.rW2C.data.copy_(Rt[:3, :2])
+            self.tW2C.data.copy_(Rt[:3, 3])
 
         self.approx_centre = -Rt[:3, :3].T @ Rt[:3, 3]
 

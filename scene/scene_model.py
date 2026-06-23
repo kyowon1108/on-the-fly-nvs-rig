@@ -76,6 +76,16 @@ class SceneModel:
         self.centre = torch.tensor([width / 2, height / 2], device="cuda")  # cx=cy=W/2 to match eqr_to_pinhole
         self.anchor_overlap = args.anchor_overlap
         self.use_rig = getattr(args, "use_rig", False)
+        self.freeze_rig_poses = getattr(args, "freeze_rig_poses", False)
+        # Rig-pose ownership (rotation-only rig): the photometric optimizer owns
+        # ONE shared 9-DoF pose per timestep (rig_R6D 6 + rig_t 3). Each view pose
+        # is derived as rel @ rig (rel_t=0), so the N views of a ts stay rigidly
+        # co-centered through optimization. register_rig_poses (bootstrap) /
+        # append_rig_pose (incremental) populate these. When rig_optimizer is set,
+        # get_Rts() bypasses the Rt cache (poses change every iteration).
+        self.rig_R6D = torch.nn.ParameterList()
+        self.rig_t = torch.nn.ParameterList()
+        self.rig_optimizer = None
         self.optimization_thread = None
 
         try:
@@ -281,6 +291,8 @@ class SceneModel:
         # Zero gradients
         keyframe.zero_grad()
         self.optimizer.zero_grad()
+        if self.rig_optimizer is not None:  # (rig) shared per-ts pose
+            self.rig_optimizer.zero_grad()
 
         # Render image and depth
         render_pkg = self.render_from_id(
@@ -324,6 +336,14 @@ class SceneModel:
                 self.optimizer.step(
                     render_pkg["visibility_filter"], render_pkg["radii"].shape[0]
                 )
+
+                # (rig) ONE shared rig-pose step moves all N views of this
+                # timestep together → rel_t stays exactly 0. Gated on not-is_test
+                # (holdout never perturbs the rig pose) and the freeze flag.
+                if (getattr(keyframe, "is_rig_mode", False)
+                        and self.rig_optimizer is not None
+                        and not self.freeze_rig_poses):
+                    self.rig_optimizer.step()
 
                 # NOTE: raw_scaling.clamp was here but REMOVED.
                 # Clamping scaling created Adam optimizer state mismatch that
@@ -650,6 +670,11 @@ class SceneModel:
         return prev_keyframes
 
     def get_Rts(self):
+        # (rig) rig_R6D/rig_t are stepped every photometric iteration, so a cached
+        # Rt would carry a stale autograd graph and be numerically out of date.
+        # Recompute from the live shared rig pose each call.
+        if self.rig_optimizer is not None:
+            return torch.stack([kf.get_Rt() for kf in self.keyframes])
         invalid_ids = torch.where(~self.valid_Rt_cache)[0]
         if len(invalid_ids) > 0:
             for keyframe_id in invalid_ids:
@@ -882,11 +907,47 @@ class SceneModel:
             self.active_frames_gpu.insert(0, frame_id)
             self.active_frames_cpu.remove(frame_id) 
 
+    def register_rig_poses(self, rig_R6D_init, rig_t_init, lr):
+        """(rig) Bootstrap setup. Wrap each per-ts (3,2) rotation + (3,) translation
+        as an nn.Parameter owned by a dedicated rig_optimizer. View poses derive
+        from these as rel @ rig, so the N views of a timestep stay rigidly
+        co-centered (rel_t=0) through photometric optimization."""
+        from scene.optimizers import BaseAdam
+        assert len(self.rig_R6D) == 0, "rig poses already registered"
+        params = {}
+        for i in range(rig_R6D_init.shape[0]):
+            p_R = torch.nn.Parameter(rig_R6D_init[i].clone())
+            p_t = torch.nn.Parameter(rig_t_init[i].clone())
+            self.rig_R6D.append(p_R)
+            self.rig_t.append(p_t)
+            params[f"rig_R6D_{i}"] = {"val": p_R, "lr": lr}
+            params[f"rig_t_{i}"] = {"val": p_t, "lr": lr}
+        self.rig_optimizer = BaseAdam(params, betas=(0.8, 0.99))
+
+    def append_rig_pose(self, rig_R6D_new, rig_t_new, lr=None):
+        """(rig) Incremental grow. Add one ts slot, registering its params with
+        rig_optimizer while preserving the moments of already-registered ts."""
+        assert self.rig_optimizer is not None, \
+            "register_rig_poses must be called before append_rig_pose"
+        p_R = torch.nn.Parameter(rig_R6D_new.clone())
+        p_t = torch.nn.Parameter(rig_t_new.clone())
+        self.rig_R6D.append(p_R)
+        self.rig_t.append(p_t)
+        new_idx = len(self.rig_R6D) - 1
+        if lr is None:
+            lr = next(iter(self.rig_optimizer.params.values()))["lr"]
+        self.rig_optimizer.add_param(f"rig_R6D_{new_idx}", p_R, lr=lr)
+        self.rig_optimizer.add_param(f"rig_t_{new_idx}", p_t, lr=lr)
+
     def add_keyframe(self, keyframe: Keyframe, f=None):
         """Add a keyframe to the scene, add and prune Gaussians"""
 
-        # Make sure training is not running 
+        # Make sure training is not running
         self.join_optimization_thread()
+
+        # (rig) attach scene_model back-ref so get_R/get_t use the shared rig pose
+        if getattr(keyframe, "is_rig_mode", False):
+            keyframe.scene_model = self
 
         ## Add the keyframe and update the indices (sorted by distance to last keyframe)
         self.keyframes.append(keyframe)
