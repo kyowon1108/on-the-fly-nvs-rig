@@ -112,6 +112,8 @@ def get_args():
     ## Keyframe management
     parser.add_argument('--max_active_keyframes', type=int, default=200,
                         help="Maximum number of keyframes to keep in GPU memory. Will start offloading keyframes to CPU if this number is exceeded.")
+    parser.add_argument('--seed', type=int, default=0,
+                        help="RNG seed (torch + cuda + numpy) for reproducible/variance runs.")
     parser.add_argument('--n_kept_timesteps', type=int, default=2,
                         help="(rig) Recent-context window in TIMESTEPS kept live when an "
                              "anchor is placed. The kept keyframe count = n_kept_timesteps * "
