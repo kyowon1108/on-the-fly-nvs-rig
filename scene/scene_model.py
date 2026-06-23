@@ -106,6 +106,13 @@ class SceneModel:
             self.lambda_dssim = args.lambda_dssim
             self.init_proba_scaler = args.init_proba_scaler
             self.max_active_keyframes = args.max_active_keyframes
+            # (rig) recent-context window in TIMESTEPS; n_rig_views (=N) is set by
+            # train.py from the rig config. n_kept_frames is then N-view-aware
+            # (= n_kept_timesteps * N) instead of a fixed keyframe count, so a 6/12/
+            # 15-view rig keeps the same number of recent TIMESTEPS live, not frames.
+            self.n_rig_views = 1
+            self.n_kept_timesteps = getattr(args, "n_kept_timesteps", 2)
+            self.n_kept_frames = 20  # default until place_anchor_if_needed sets it
             self.use_last_frame_proba = args.use_last_frame_proba
             self.active_frames_cpu = []
             self.active_frames_gpu = []
@@ -1038,7 +1045,11 @@ class SceneModel:
         """Check if many Gaussians appear small on the screen. If so, place a new anchor. and merge the Gaussians."""
         small_prop_thresh = 0.4
         k = 3
-        self.n_kept_frames = 20
+        # N-view-aware recent-context window: keep the last n_kept_timesteps full
+        # timesteps (= n_kept_timesteps * N_views keyframes) live, so a 6/9/12/15-
+        # view rig keeps the same number of recent TIMESTEPS, not a fixed frame
+        # count. Non-rig keeps the original 20.
+        self.n_kept_frames = (self.n_kept_timesteps * self.n_rig_views) if self.use_rig else 20
         if (
             self.xyz.shape[0] > 0
             and self.first_active_frame < len(self.keyframes) - 2 * self.n_kept_frames

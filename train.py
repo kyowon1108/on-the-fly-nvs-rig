@@ -71,6 +71,10 @@ if __name__ == "__main__":
     dense_extractor = DenseExtractor(width, height)
     depth_estimator = MonoDepthEstimator(width, height)
     scene_model = SceneModel(width, height, args, matcher)
+    if args.use_rig:
+        # N-view-aware active window: tell scene_model how many views per timestep
+        # so n_kept_frames scales as n_kept_timesteps * N (6/9/12/15-view rigs).
+        scene_model.n_rig_views = len(dataset.rig.view_names)
     detector = Detector(args.num_kpts, width, height)
 
     # Initialize the viewer
