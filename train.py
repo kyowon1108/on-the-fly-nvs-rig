@@ -173,15 +173,19 @@ if __name__ == "__main__":
                 # Pre-compute monocular inverse depth per (ts, view) so the rig
                 # bootstrap seeds 3D points with a geometric prior (DA-V2) instead
                 # of unit depth -> wide views (>90 deg off ref) survive (Issue A).
-                mono_idepth_per_ts_per_view = []
-                for data in bootstrap_rig_data:
-                    view_dict = {}
-                    for v in view_order:
-                        idepth, _ = depth_estimator(data["frames"][v][0])
-                        view_dict[v] = torch.nn.functional.interpolate(
-                            idepth, (height, width), mode="bilinear", align_corners=True,
-                        )
-                    mono_idepth_per_ts_per_view.append(view_dict)
+                # OTF_NO_MONO_SEED=1 disables the prior (unit-depth seed) to A/B
+                # the mono-seed in isolation; default path uses the DA-V2 prior.
+                mono_idepth_per_ts_per_view = None
+                if not os.environ.get("OTF_NO_MONO_SEED"):
+                    mono_idepth_per_ts_per_view = []
+                    for data in bootstrap_rig_data:
+                        view_dict = {}
+                        for v in view_order:
+                            idepth, _ = depth_estimator(data["frames"][v][0])
+                            view_dict[v] = torch.nn.functional.interpolate(
+                                idepth, (height, width), mode="bilinear", align_corners=True,
+                            )
+                        mono_idepth_per_ts_per_view.append(view_dict)
                 rig_Rts, f_out, res, _xyz, _view_names = (
                     pose_initializer.initialize_bootstrap_rig(
                         desc_per_ts_per_view, dataset.rig,

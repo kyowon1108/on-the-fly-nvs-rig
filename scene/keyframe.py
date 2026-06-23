@@ -85,17 +85,25 @@ class Keyframe:
 
         # Optimizer
         if not inference_mode: # Only create optimizer in training mode
-            params = {
-                "rW2C": {"val": self.rW2C, "lr": args.lr_poses},
-                "tW2C": {"val": self.tW2C, "lr": args.lr_poses},
-                "depth_scale": {
-                    "val": self.depth_scale,
-                    "lr": args.lr_depth_scale_offset,
-                },
-                "depth_offset": {
-                    "val": self.depth_offset,
-                    "lr": args.lr_depth_scale_offset,
-                },
+            # Rig holdout: freeze the held-out view's pose at the rig prediction
+            # (rel @ rig_pose) so eval measures novel-view generalisation, not
+            # test-time pose fitting to the held-out GT. Non-rig test frames keep
+            # pose tracking (original OTF protocol).
+            freeze_pose = getattr(args, "use_rig", False) and info["is_test"]
+            if freeze_pose:
+                self.rW2C.requires_grad_(False)
+                self.tW2C.requires_grad_(False)
+            params = {}
+            if not freeze_pose:
+                params["rW2C"] = {"val": self.rW2C, "lr": args.lr_poses}
+                params["tW2C"] = {"val": self.tW2C, "lr": args.lr_poses}
+            params["depth_scale"] = {
+                "val": self.depth_scale,
+                "lr": args.lr_depth_scale_offset,
+            }
+            params["depth_offset"] = {
+                "val": self.depth_offset,
+                "lr": args.lr_depth_scale_offset,
             }
             if not info["is_test"]:
                 params["exposure"] = {"val": self.exposure, "lr": args.lr_exposure}

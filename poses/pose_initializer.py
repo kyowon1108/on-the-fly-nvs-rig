@@ -360,8 +360,10 @@ class PoseInitializer():
             hi = (v_idx + 1) * npts_per_view
             uv[lo:hi, :, v_idx, :] = uvs_v
 
-            # Seed xyz from each point's first valid observation, back-projecting
-            # at unit depth and lifting into the rig frame (identity rig_pose[0]).
+            # Seed xyz from each point's first valid observation. With a mono-depth
+            # prior we seed at that depth (preserving magnitude & relative ordering);
+            # without one we fall back to unit depth ALONG THE CAMERA AXIS, then lift
+            # into the rig frame (identity rig_pose[0]).
             valid = (uvs_v >= 0).all(dim=-1)  # (npts_per_view, N_ts)
             for p in range(npts_per_view):
                 ts_hits = valid[p].nonzero(as_tuple=False).flatten()
@@ -370,18 +372,25 @@ class PoseInitializer():
                 ts_idx = int(ts_hits[0].item())
                 uv_pt = uvs_v[p, ts_idx]
                 depth_pt = 1.0
+                has_mono = False
                 if mono_depth_maps is not None:
                     sampled = sample(mono_depth_maps[ts_idx][v_name],
                                      uv_pt.view(1, 1, 1, 2), self.width, self.height)
                     d = float(sampled[0, 0, 0, 0].item())
                     if d > 0 and math.isfinite(d):
-                        depth_pt = d  # mono-depth seed (else fall back to unit depth)
+                        depth_pt = d
+                        has_mono = True
                 local = depth2points(uv_pt[None], depth_pt, f_init_t, self.centre)[0]
+                if not has_mono:
+                    # No depth prior: unit depth ALONG THE CAMERA AXIS (z==depth here)
+                    # + radial jitter, applied in the camera frame BEFORE the rig lift.
+                    # Doing it here (not on world-z afterwards, as the old collapse did)
+                    # keeps wide views on their true viewing ray instead of reflecting
+                    # them to z<0 (roadmap Issue A). For mono points we keep `local`
+                    # as-is; the global 0.1 normalisation re-anchors absolute scale.
+                    local = local / local[..., -1:].clamp_min(1e-6)
+                    local = local * (1 + torch.randn_like(local[..., :1]).abs())
                 xyz_init[lo + p] = rel_R_all[v_idx].T @ local
-
-        xyz_init /= xyz_init[..., -1:].clamp_min(1)
-        xyz_init[..., -1] = 1
-        xyz_init *= 1 + torch.randn_like(xyz_init[:, :1]).abs()
 
         rig_R_init = torch.eye(3, 2, device="cuda")[None].repeat(N_ts, 1, 1).contiguous()
         rig_t_init = torch.zeros(N_ts, 3, device="cuda")

@@ -75,6 +75,7 @@ class SceneModel:
         self.matcher = matcher
         self.centre = torch.tensor([width / 2, height / 2], device="cuda")  # cx=cy=W/2 to match eqr_to_pinhole
         self.anchor_overlap = args.anchor_overlap
+        self.use_rig = getattr(args, "use_rig", False)
         self.optimization_thread = None
 
         try:
@@ -607,6 +608,18 @@ class SceneModel:
         self.join_optimization_thread()
 
         candidate_idx = self.sorted_frame_indices
+        if self.use_rig:
+            # Holdout/test keyframes must never be triangulation / MVS / PnP
+            # partners: their geometry would leak into the poses & depths of the
+            # training views, inflating the held-out metric. Drop them from the
+            # candidate pool up-front (covers both the incremental PnP selection
+            # and the guided-MVS neighbour selection).
+            keep_train = torch.tensor(
+                [not self.keyframes[int(i)].info.get("is_test", False)
+                 for i in candidate_idx],
+                device=candidate_idx.device,
+            )
+            candidate_idx = candidate_idx[keep_train]
         if exclude_ts is not None:
             keep = torch.tensor(
                 [self.keyframes[int(i)].info.get("rig_ts") != exclude_ts for i in candidate_idx],
