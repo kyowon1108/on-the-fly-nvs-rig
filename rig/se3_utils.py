@@ -23,6 +23,42 @@ def _so3_log(R: Tensor) -> Tensor:
         k * (R[..., 0, 2] - R[..., 2, 0]),
         k * (R[..., 1, 0] - R[..., 0, 1]),
     ], dim=-1)
+    # theta -> pi: the antisymmetric formula above suffers catastrophic cancellation
+    # (the off-diagonal differences are 2 sin(theta)*a, a near-zero difference of two
+    # O(1) entries, then amplified by k ~ theta/(2 sin theta)). Recover the axis from
+    # the *symmetric* part instead, which is exact for any theta and cancellation-free:
+    #   S = (R + R^T)/2 = cos(theta) I + (1-cos theta) a a^T
+    #   => a a^T = (S - cos(theta) I) / (1 - cos theta)
+    # take a_i = sqrt(diag), fix relative signs from column i_max, then fix the global
+    # sign from the (still-informative for theta<pi) antisymmetric part. Switch over at
+    # theta>2 rad where both formulas agree, so the where() blend is continuous. Rare in
+    # rig PnP (candidate deltas are tiny) but a 180deg-off outlier would otherwise yield
+    # a garbage rotation distance the Huber kernel can't reject.
+    near_pi = theta > 2.0
+    if near_pi.any():
+        eye = torch.eye(3, device=R.device, dtype=R.dtype)
+        S = (R + R.transpose(-1, -2)) * 0.5
+        cos_e = cos.unsqueeze(-1).unsqueeze(-1)
+        aaT = (S - cos_e * eye) / (1.0 - cos_e).clamp_min(_EPS)   # a a^T, exact
+        diag = aaT.diagonal(dim1=-2, dim2=-1).clamp_min(0.0)      # a_i^2
+        i_max = diag.argmax(dim=-1, keepdim=True)
+        col = torch.gather(aaT, -1, i_max.unsqueeze(-2).expand(*aaT.shape[:-1], 1)).squeeze(-1)
+        rel = torch.sign(col)
+        rel = torch.where(rel == 0, torch.ones_like(rel), rel)   # signs rel. to a_{i_max}>0
+        axis = diag.sqrt() * rel
+        axis = axis / axis.norm(dim=-1, keepdim=True).clamp_min(_EPS)
+        antisym = torch.stack([
+            R[..., 2, 1] - R[..., 1, 2],
+            R[..., 0, 2] - R[..., 2, 0],
+            R[..., 1, 0] - R[..., 0, 1],
+        ], dim=-1)                                               # = 2 sin(theta) a
+        gsign = torch.where(
+            (antisym * axis).sum(-1, keepdim=True) < 0,
+            -torch.ones_like(theta).unsqueeze(-1),
+            torch.ones_like(theta).unsqueeze(-1),
+        )
+        w_pi = axis * gsign * theta.unsqueeze(-1)
+        w = torch.where(near_pi.unsqueeze(-1), w_pi, w)
     return w
 
 
