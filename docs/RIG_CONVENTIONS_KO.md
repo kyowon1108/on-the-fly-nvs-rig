@@ -162,8 +162,11 @@ window를 다시 잡는 기능이다. rig mode에 그대로 붙이면 timestep �
 
 upstream `--test_hold`는 매 N번째 image를 test로 태그한다. rig에서는 image가 아니라
 timestep-view 구조이므로 그대로 쓰면 한 timestep 안의 일부 view가 train/test로 섞여
-shared pose leakage가 생긴다. rig에서는 `--test_hold` 대신
-`--rig_holdout_view <non_ref_view>`를 쓴다.
+shared pose leakage가 생긴다. 논문용 rig NVS split은 `--test_hold` 대신
+`--rig_train_timesteps_file splits/ob3d/egocentric/<scene>/train.txt`와
+`--rig_test_timesteps_file splits/ob3d/egocentric/<scene>/test.txt`를 함께 쓴다.
+`--rig_holdout_view <non_ref_view>`는 같은 timestep의 unseen direction diagnostic으로만
+쓴다.
 
 ### `--use_colmap_poses`
 

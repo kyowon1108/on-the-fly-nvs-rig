@@ -63,12 +63,14 @@ def collect_one(run: Path) -> dict[str, Any]:
     ate = read_json(run / "ate_ob3d_rig.json")
     split = read_json(run / "render_eval" / "split_metrics.json")
     train = split.get("train_views", {})
-    holdout = split.get("holdout_views_summary", {})
+    test = split.get("test_frames", split.get("holdout_views_summary", {}))
+    tracking = split.get("tracking_frames", {})
     all_views = split.get("all_views", {})
     return {
         "run": str(run),
         "scene": infer_scene(run, metadata),
         "ablation": infer_ablation(run),
+        "render_split_mode": split.get("split_mode", ""),
         "num_keyframes": metadata.get("num keyframes", ""),
         "runtime_sec": metadata.get("time", ""),
         "fps": metadata.get("FPS", ""),
@@ -82,10 +84,15 @@ def collect_one(run: Path) -> dict[str, Any]:
         "train_psnr": metric(train, "psnr_mean"),
         "train_ssim": metric(train, "ssim_mean"),
         "train_lpips": metric(train, "lpips_mean"),
-        "holdout_num_frames": metric(holdout, "num_frames"),
-        "holdout_psnr": metric(holdout, "psnr_mean"),
-        "holdout_ssim": metric(holdout, "ssim_mean"),
-        "holdout_lpips": metric(holdout, "lpips_mean"),
+        "test_num_frames": metric(test, "num_frames"),
+        "test_psnr": metric(test, "psnr_mean"),
+        "test_ssim": metric(test, "ssim_mean"),
+        "test_lpips": metric(test, "lpips_mean"),
+        "tracking_num_frames": metric(tracking, "num_frames"),
+        "holdout_num_frames": metric(test, "num_frames"),
+        "holdout_psnr": metric(test, "psnr_mean"),
+        "holdout_ssim": metric(test, "ssim_mean"),
+        "holdout_lpips": metric(test, "lpips_mean"),
         "all_psnr": metric(all_views, "psnr_mean"),
         "all_ssim": metric(all_views, "ssim_mean"),
         "all_lpips": metric(all_views, "lpips_mean"),

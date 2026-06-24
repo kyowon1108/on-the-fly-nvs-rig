@@ -11,6 +11,7 @@ per-view poses are derived as rel @ rig (no independent per-view pose, rel_t=0).
 import json
 import logging
 import os
+import re
 from argparse import Namespace
 from concurrent.futures import ThreadPoolExecutor
 from queue import Queue
@@ -26,6 +27,45 @@ from utils import get_image_names
 def _frame_key(view: str, ts: int) -> str:
     # Unique key used both as `info["name"]` and as the dict key in `self.infos`.
     return f"{view}__ts{ts:05d}"
+
+
+def _parse_timestep_token(token: str) -> int:
+    """Parse an OB3D split token into the original integer frame index.
+
+    OB3D split files use bare integers (e.g. `2`), while local tooling often
+    names prepared pinholes as `frame_000002.png`. Accept both so the split
+    manifest can stay close to the source dataset or to the prepared rig tree.
+    """
+    token = token.strip()
+    if not token:
+        raise ValueError("empty timestep token")
+    if token.isdigit():
+        return int(token)
+    base = os.path.basename(token)
+    match = re.search(r"(\d+)", base)
+    if match is None:
+        raise ValueError(f"Cannot parse timestep index from split token: {token!r}")
+    return int(match.group(1))
+
+
+def _load_timestep_split(path: str, valid_timesteps: set[int]) -> set[int]:
+    test_timesteps: set[int] = set()
+    with open(path) as f:
+        for line_no, line in enumerate(f, 1):
+            line = line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            ts = _parse_timestep_token(line)
+            if ts not in valid_timesteps:
+                raise ValueError(
+                    f"{path}:{line_no}: timestep {ts} is not present in the "
+                    f"prepared rig scene. Valid range/sample: "
+                    f"{min(valid_timesteps)}..{max(valid_timesteps)}"
+                )
+            test_timesteps.add(ts)
+    if not test_timesteps:
+        raise ValueError(f"No test timesteps found in {path}")
+    return test_timesteps
 
 
 class RigImageDataset:
@@ -128,8 +168,13 @@ class RigImageDataset:
             self.num_timesteps = len(self.timestep_names)
 
         # Per-item metadata consumed by the training loop.
-        # is_test marks holdout-view frames so add_new_gaussians skips them
-        # (pose is still estimated; only Gaussian spawn is suppressed).
+        # is_test marks held-out frames so add_new_gaussians and the scene loss
+        # skip them, while the online stream still estimates their poses. Two
+        # holdout modes exist:
+        #   1) rig_holdout_view: one direction across all timesteps (diagnostic)
+        #   2) rig_test_timesteps_file: all N views for held-out EQR timesteps
+        #   3) rig_train_timesteps_file + rig_test_timesteps_file: OB3D-style
+        #      train/test split; remaining timesteps are tracking-only.
         holdout_view = (getattr(args, "rig_holdout_view", "") or "").strip()
         if holdout_view and holdout_view not in self.rig.view_names:
             raise ValueError(
@@ -142,14 +187,63 @@ class RigImageDataset:
                 "ref view is needed for bootstrap and incremental pose tracking."
             )
         self.holdout_view = holdout_view
+        test_split_file = (getattr(args, "rig_test_timesteps_file", "") or "").strip()
+        train_split_file = (getattr(args, "rig_train_timesteps_file", "") or "").strip()
+        self.test_timesteps: set[int] = set()
+        self.train_timesteps: set[int] = set()
+        valid_timesteps = {item["ts"] for item in self.items}
+        if test_split_file:
+            if holdout_view:
+                raise ValueError(
+                    "--rig_holdout_view and --rig_test_timesteps_file are mutually exclusive"
+                )
+            if not os.path.exists(test_split_file):
+                raise FileNotFoundError(
+                    f"--rig_test_timesteps_file not found: {test_split_file}"
+                )
+            self.test_timesteps = _load_timestep_split(test_split_file, valid_timesteps)
+        if train_split_file:
+            if not test_split_file:
+                raise ValueError(
+                    "--rig_train_timesteps_file requires --rig_test_timesteps_file"
+                )
+            if not os.path.exists(train_split_file):
+                raise FileNotFoundError(
+                    f"--rig_train_timesteps_file not found: {train_split_file}"
+                )
+            self.train_timesteps = _load_timestep_split(train_split_file, valid_timesteps)
+            overlap = sorted(self.train_timesteps & self.test_timesteps)
+            if overlap:
+                raise ValueError(
+                    "Train/test timestep splits overlap; first overlaps: "
+                    f"{overlap[:10]}"
+                )
+        self.holdout_mode = (
+            "ob3d"
+            if self.train_timesteps and self.test_timesteps
+            else ("timestep" if self.test_timesteps else ("view" if holdout_view else "none"))
+        )
         self.infos: Dict[str, dict] = {}
         for item in self.items:
             key = _frame_key(item["view"], item["ts"])
+            if item["ts"] in self.test_timesteps:
+                eval_split = "test"
+            elif self.train_timesteps:
+                eval_split = "train" if item["ts"] in self.train_timesteps else "tracking"
+            elif holdout_view and item["view"] == holdout_view:
+                eval_split = "test"
+            else:
+                eval_split = "train"
             self.infos[key] = {
-                "is_test": (holdout_view != "" and item["view"] == holdout_view),
+                # Historical bool consumed by SceneModel as an optimization gate.
+                # In OB3D train/test mode, tracking-only frames are also excluded
+                # from Gaussian/loss updates, so they are True here but are NOT
+                # counted as test metrics (`rig_eval_split == "tracking"`).
+                "is_test": (eval_split != "train"),
                 "name": key,
                 "rig_view": item["view"],
                 "rig_ts": item["ts"],
+                "rig_eval_split": eval_split,
                 "rig_filename": item["filename"],
                 "rig_relative_Rt": self.rig.relative_Rt[item["view"]].clone(),
             }

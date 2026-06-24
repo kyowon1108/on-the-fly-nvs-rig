@@ -14,23 +14,25 @@ cd /home/kaprub22/otfrig/on-the-fly-nvs
 
 COMMON="-s /home/kaprub22/otfrig/pinhole_rig/ob3d_rig/classroom_100 \
   --use_rig --rig_config /home/kaprub22/otfrig/tools/configs/rig12_panosfm.json \
-  --ref_view E+0_A000 --init_focal 200 --fix_focal \
+  --ref_view E+0_A000 \
+  --rig_train_timesteps_file splits/ob3d/egocentric/classroom/train.txt \
+  --rig_test_timesteps_file splits/ob3d/egocentric/classroom/test.txt \
+  --init_focal 200 --fix_focal \
   --downsampling 1 --num_keyframes_miniba_bootstrap 8 \
   --num_iterations 270 --seed 0 --viewer_mode none \
   --max_active_keyframes 60"
 ```
 
-가능하면 모든 ablation에 같은 holdout view를 추가한다.
-
-```bash
-COMMON="$COMMON --rig_holdout_view E+0_A090"
-```
+`--rig_train_timesteps_file`과 `--rig_test_timesteps_file`은 OB3D 공식 `train.txt/test.txt`를
+가리킨다. scene이 바뀌면 `classroom` 부분만 해당 scene 이름으로 바꾼다.
+`--rig_holdout_view`는 여기서 쓰지 않는다. 그 옵션은 이미 본 timestep에서 특정 direction만
+빼는 diagnostic이므로 논문용 NVS 주지표가 아니다.
 
 기록해야 하는 metric:
 
 - registration: registered timestep 수
 - pose: OB3D GT center ATE meter, ATE %span, same-ts spread
-- render: train-view PSNR/SSIM/LPIPS, holdout-view PSNR/SSIM/LPIPS
+- render: train-view PSNR/SSIM/LPIPS, test-timestep PSNR/SSIM/LPIPS
 - efficiency: wall-clock, per-phase runtime(`--display_runtimes`), peak GPU memory
 - model state: final Gaussian count, anchor count, crash 여부
 

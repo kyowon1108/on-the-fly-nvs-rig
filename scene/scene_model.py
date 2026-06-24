@@ -280,17 +280,39 @@ class SceneModel:
     def n_active_keyframes(self):
         return self.last_active_frame - self.first_active_frame + 1
 
+    def _active_optimization_frames(self):
+        """Return active frame ids that may drive scene/rig optimization.
+
+        In rig evaluation splits, `is_test=True` covers both metric test frames
+        and tracking-only frames. They stay in the online stream for pose
+        registration, but their RGB must not consume optimization iterations or
+        update Gaussian/rig state. Non-rig keeps the upstream behavior.
+        """
+        if not self.use_rig:
+            return self.active_frames_gpu
+        train_frames = [
+            i for i in self.active_frames_gpu
+            if not self.keyframes[i].info.get("is_test", False)
+        ]
+        return train_frames if train_frames else self.active_frames_gpu
+
     def optimization_step(self, finetuning=False):
         if len(self.xyz) == 0:
             return
         # Select which keyframe to train on
         # We train on the latest keyframe with self.use_last_frame_proba probability or a random keyframe otherwise
+        active_optim_frames = self._active_optimization_frames()
+        latest_is_train = (
+            not self.use_rig
+            or not self.keyframes[-1].info.get("is_test", False)
+        )
         if (
             np.random.rand() > self.use_last_frame_proba
             or self.last_trained_id == -1
             or finetuning
+            or not latest_is_train
         ):
-            keyframe_id = np.random.choice(self.active_frames_gpu)
+            keyframe_id = np.random.choice(active_optim_frames)
         else:
             keyframe_id = -1
         keyframe = self.keyframes[keyframe_id]

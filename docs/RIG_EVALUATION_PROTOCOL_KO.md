@@ -1,6 +1,6 @@
 # OTF Rig Evaluation Protocol
 
-이 문서는 rig 실험에서 pose metric, train-view render metric, holdout-view render metric을
+이 문서는 rig 실험에서 pose metric, train-view render metric, test-timestep render metric을
 분리해 보고하기 위한 실행 규칙이다.
 
 ## 1. 절대 원칙: pose와 NVS metric을 섞지 않는다
@@ -13,9 +13,80 @@ Rig OTF의 주장은 두 축이다.
 첫 번째는 OB3D GT center ATE/RRA/RTA로 평가한다. 두 번째는 PSNR/SSIM/LPIPS로 평가한다.
 train-view PSNR은 optimization self-render라서 generalization metric이 아니다.
 
-## 2. `--rig_holdout_view`
+## 2. 논문용 NVS split: `--rig_train_timesteps_file` + `--rig_test_timesteps_file`
 
-Canonical holdout command:
+OB3D는 EQR frame 단위의 train/test split을 제공한다. 따라서 논문 표의 NVS metric은
+virtual pinhole view 하나를 빼는 방식이 아니라, **train EQR timestep과 test EQR timestep을
+명시적으로 나누는 방식**이어야 한다. OB3D의 `train.txt`와 `test.txt`는 각각 25개 frame만
+담고 있으므로, 나머지 50개 frame을 몰래 train으로 쓰면 OB3D split이 아니다.
+
+$$
+t \in \mathcal{T}_{test}
+\Rightarrow
+\{(t, v)\mid v=1,\ldots,N\}\ \text{is held out}
+$$
+
+$$
+t \notin \mathcal{T}_{train}\cup\mathcal{T}_{test}
+\Rightarrow
+\{(t, v)\mid v=1,\ldots,N\}\ \text{is tracking-only}
+$$
+
+Canonical OB3D-style command:
+
+```bash
+python train.py -s /home/kaprub22/otfrig/pinhole_rig/ob3d_rig/classroom_100 \
+  --use_rig --rig_config /home/kaprub22/otfrig/tools/configs/rig12_panosfm.json \
+  --ref_view E+0_A000 \
+  --rig_train_timesteps_file splits/ob3d/egocentric/classroom/train.txt \
+  --rig_test_timesteps_file splits/ob3d/egocentric/classroom/test.txt \
+  --init_focal 200 --fix_focal --downsampling 1 \
+  --num_iterations 270 --seed 0 --viewer_mode none \
+  -m results/seed0_default/classroom
+```
+
+동작:
+
+- `RigImageDataset`가 train/test split 파일의 timestep index를 읽는다.
+- train timestep의 모든 rig view는 `rig_eval_split="train"`이 된다.
+- test timestep의 모든 rig view는 `rig_eval_split="test"`가 된다.
+- 둘 다 아닌 timestep은 `rig_eval_split="tracking"`이 된다.
+- pose tracking/registration은 online stream 안에서 그대로 수행한다.
+- Gaussian spawn, scene optimization loss, PnP/MVS previous-keyframe pool에는 train keyframe만
+  들어간다.
+- rig mode의 optimization sampler도 train keyframe만 뽑는다. test/tracking frame이 active
+  memory에 있어도 scene/rig optimization iteration을 소비하지 않는다.
+- 즉 이 protocol은 known-pose NVS가 아니라 online unknown-pose 평가다. test frame RGB는 자기
+  pose tracking 입력으로는 쓰이지만, radiance field/Gaussian scene fitting에는 쓰지 않는다.
+- tracking-only frame도 scene fitting에는 쓰지 않고 metric에서도 제외한다.
+- post-hoc render eval은 모든 keyframe을 렌더한 뒤 `rig_eval_split`으로 train/test/tracking을
+  분리한다.
+
+현재 repo에 저장한 공식 split:
+
+```text
+splits/ob3d/egocentric/<scene>/train.txt
+splits/ob3d/egocentric/<scene>/test.txt
+```
+
+출처는 Kaggle `shintacs/ob3d-dataset`의
+`OB3D/<scene>/Egocentric/{train.txt,test.txt}`다.
+
+금지:
+
+- `--rig_test_timesteps_file`과 `--rig_holdout_view`를 섞지 않는다.
+- `--rig_train_timesteps_file` 없이 `--rig_test_timesteps_file`만 쓰면 "test만 제외하고 나머지
+  75개를 train"으로 쓰는 별도 protocol이 된다. OB3D official NVS claim에는 쓰지 않는다.
+- `--test_hold`를 rig에서 쓰지 않는다.
+- test timestep의 RGB를 Gaussian spawn/loss/previous-keyframe pool에 넣지 않는다.
+
+## 3. 진단용 split: `--rig_holdout_view`
+
+`--rig_holdout_view`는 같은 timestep에서 특정 virtual direction만 빼는 diagnostic이다. 이미
+본 EQR timestep의 다른 view들이 scene optimization에 들어가므로 OB3D 논문 표의 주 NVS
+metric으로 쓰지 않는다.
+
+Diagnostic command:
 
 ```bash
 python train.py -s /home/kaprub22/otfrig/pinhole_rig/ob3d_rig/classroom_100 \
@@ -40,7 +111,7 @@ python train.py -s /home/kaprub22/otfrig/pinhole_rig/ob3d_rig/classroom_100 \
 - `--test_hold`와 섞어 쓰지 않는다.
 - holdout view 이미지를 Gaussian spawn 또는 previous-keyframe pool에 넣지 않는다.
 
-## 3. Train-view vs holdout-view metric
+## 4. Train-view vs test-timestep metric
 
 현재 post-hoc eval은 `results/<run>/render_eval/metrics.json`에 `summary`와 `per_frame`을
 저장한다. `summary`는 모든 frame 평균이므로 논문 표에는 그대로 쓰지 않는다.
@@ -49,8 +120,9 @@ python train.py -s /home/kaprub22/otfrig/pinhole_rig/ob3d_rig/classroom_100 \
 | split | 의미 | 논문 표 사용 |
 | --- | --- | --- |
 | `train_views` | Gaussian optimization에 들어간 view | 진단용 |
-| `holdout_view` | Gaussian spawn/optimization에서 제외된 view | NVS 주 metric |
-| `all_views` | train+holdout 혼합 | 참고용만 |
+| `test_frames` | test timestep의 모든 rig views | NVS 주 metric |
+| `tracking_frames` | pose tracking만 수행하고 scene fitting/metric에서 제외 | 표에 count만 기록 |
+| `all_views` | train+test+tracking 혼합 | 참고용만 |
 
 Metric 정의:
 
@@ -67,10 +139,10 @@ python - <<'PY'
 import json, math, statistics as st
 from pathlib import Path
 
-path = Path("results/classroom_holdout_Ep0_A090_seed0/render_eval/metrics.json")
+path = Path("results/seed0_default/classroom/render_eval/metrics.json")
 d = json.loads(path.read_text())
 for name, rows in {
-    "holdout_view": [r for r in d["per_frame"] if r["is_test"]],
+    "test_frames": [r for r in d["per_frame"] if r["is_test"]],
     "train_views": [r for r in d["per_frame"] if not r["is_test"]],
 }.items():
     lp = [r["lpips"] for r in rows if not math.isnan(r["lpips"])]
@@ -81,7 +153,7 @@ for name, rows in {
 PY
 ```
 
-## 4. OB3D GT center ATE
+## 5. OB3D GT center ATE
 
 OB3D는 exact Blender camera parameters를 제공하므로 metric ATE를 반드시 meter로 보고한다.
 `%span`은 scene-size-normalized 보조 지표일 뿐이다.

@@ -565,6 +565,10 @@ if __name__ == "__main__":
                 per_frame.append({
                     "name": name, "rig_ts": kf.info.get("rig_ts"),
                     "rig_view": kf.info.get("rig_view"),
+                    "rig_eval_split": kf.info.get(
+                        "rig_eval_split",
+                        "test" if kf.info.get("is_test", False) else "train",
+                    ),
                     "is_test": bool(kf.info.get("is_test", False)),
                     "psnr": p, "ssim": s, "lpips": l,
                 })
@@ -580,9 +584,41 @@ if __name__ == "__main__":
                 "psnr_min": float(np.min(psnrs)),
                 "psnr_max": float(np.max(psnrs)),
             }
+            split_meta = {
+                "mode": (
+                    "ob3d"
+                    if getattr(args, "rig_train_timesteps_file", "")
+                    else "timestep"
+                    if getattr(args, "rig_test_timesteps_file", "")
+                    else ("view" if getattr(args, "rig_holdout_view", "") else "none")
+                ),
+                "rig_holdout_view": getattr(args, "rig_holdout_view", ""),
+                "rig_train_timesteps_file": getattr(args, "rig_train_timesteps_file", ""),
+                "rig_test_timesteps_file": getattr(args, "rig_test_timesteps_file", ""),
+                "test_timesteps": sorted({
+                    int(x["rig_ts"]) for x in per_frame
+                    if x.get("rig_eval_split") == "test"
+                }),
+                "train_timesteps": sorted({
+                    int(x["rig_ts"]) for x in per_frame
+                    if x.get("rig_eval_split") == "train"
+                }),
+                "tracking_timesteps": sorted({
+                    int(x["rig_ts"]) for x in per_frame
+                    if x.get("rig_eval_split") == "tracking"
+                }),
+                "test_views": sorted({
+                    str(x["rig_view"]) for x in per_frame
+                    if x.get("rig_eval_split") == "test"
+                }),
+            }
             import json as _json
             with open(os.path.join(eval_dir, "metrics.json"), "w") as _f:
-                _json.dump({"summary": summary, "per_frame": per_frame}, _f, indent=2)
+                _json.dump(
+                    {"summary": summary, "split": split_meta, "per_frame": per_frame},
+                    _f,
+                    indent=2,
+                )
             print(
                 "[post-hoc render] "
                 f"n={summary['num_frames']}  "
@@ -591,27 +627,42 @@ if __name__ == "__main__":
                 f"LPIPS={summary['lpips_mean']:.3f}  "
                 f"(range PSNR {summary['psnr_min']:.2f}–{summary['psnr_max']:.2f})"
             )
-            # Claim-grade rig NVS metric: when --rig_holdout_view is set, split
-            # train views (optimized) from the holdout view (not spawned/optimized).
-            # The all-frame mean is diagnostic only because it mixes both regimes.
-            holdout_pf = [x for x in per_frame if x["is_test"]]
-            train_pf = [x for x in per_frame if not x["is_test"]]
-            if holdout_pf:
-                hp = [x["psnr"] for x in holdout_pf]
-                hs = [x["ssim"] for x in holdout_pf]
-                hl = [x["lpips"] for x in holdout_pf
+            # Rig NVS metric: split optimized training frames from held-out
+            # frames. `--rig_test_timesteps_file` is the claim-grade OB3D-style
+            # split (all N virtual views from held-out EQR timesteps). The older
+            # `--rig_holdout_view` split is a diagnostic for unseen direction at
+            # seen timesteps.
+            test_pf = [x for x in per_frame if x.get("rig_eval_split") == "test"]
+            train_pf = [x for x in per_frame if x.get("rig_eval_split") == "train"]
+            tracking_pf = [
+                x for x in per_frame if x.get("rig_eval_split") == "tracking"
+            ]
+            if test_pf:
+                hp = [x["psnr"] for x in test_pf]
+                hs = [x["ssim"] for x in test_pf]
+                hl = [x["lpips"] for x in test_pf
                       if not (x["lpips"] != x["lpips"])]
                 tp = [x["psnr"] for x in train_pf]
                 ts = [x["ssim"] for x in train_pf]
                 tl = [x["lpips"] for x in train_pf
                       if not (x["lpips"] != x["lpips"])]
+                if getattr(args, "rig_test_timesteps_file", ""):
+                    held_ts = sorted({int(x["rig_ts"]) for x in test_pf})
+                    split_label = (
+                        f"test timesteps={len(held_ts)} "
+                        f"file={args.rig_test_timesteps_file}"
+                    )
+                else:
+                    split_label = f"holdout view={args.rig_holdout_view}"
                 print(
-                    f"[holdout view={args.rig_holdout_view}] "
-                    f"n={len(holdout_pf)}  "
+                    f"[{split_label}] "
+                    f"n={len(test_pf)}  "
                     f"PSNR={float(np.mean(hp)):.2f}  "
                     f"SSIM={float(np.mean(hs)):.3f}  "
                     f"LPIPS={(float(np.mean(hl)) if hl else float('nan')):.3f}"
                 )
+                if tracking_pf:
+                    print(f"[tracking-only frames] n={len(tracking_pf)}  metrics excluded")
                 print(
                     f"[train views] "
                     f"n={len(train_pf)}  "

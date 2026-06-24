@@ -16,6 +16,8 @@ import os
 def _validate_rig_args(args, parser):
     """Reject upstream single-camera options that violate rig invariants."""
     if not args.use_rig:
+        if args.rig_test_timesteps_file or args.rig_train_timesteps_file:
+            parser.error("--rig_train_timesteps_file/--rig_test_timesteps_file require --use_rig")
         return
 
     forbidden = []
@@ -33,6 +35,17 @@ def _validate_rig_args(args, parser):
         forbidden.append(
             "--use_colmap_poses imports per-image poses; rig mode requires one "
             "shared pose per timestep and view poses derived as relative_R @ rig_R."
+        )
+    if args.rig_train_timesteps_file and not args.rig_test_timesteps_file:
+        forbidden.append(
+            "--rig_train_timesteps_file requires --rig_test_timesteps_file so "
+            "train/test/tracking-only frames are explicit."
+        )
+    if args.rig_holdout_view and (args.rig_test_timesteps_file or args.rig_train_timesteps_file):
+        forbidden.append(
+            "--rig_holdout_view and rig timestep split files are mutually "
+            "exclusive; use timestep holdout for claim-grade OB3D NVS metrics "
+            "and view holdout only as a diagnostic."
         )
 
     if forbidden:
@@ -170,8 +183,20 @@ def get_args():
     parser.add_argument('--rig_holdout_view', type=str, default="",
                         help="If set (e.g. 'Low_Cam08'), this view is excluded from "
                              "Gaussian optimization but kept for pose estimation and "
-                             "post-hoc evaluation. Provides an honest generalization "
-                             "metric (avoids the self-render inflation when this is empty).")
+                             "post-hoc evaluation. Diagnostic only: claim-grade OB3D "
+                             "NVS uses --rig_test_timesteps_file.")
+    parser.add_argument('--rig_test_timesteps_file', type=str, default="",
+                        help="Rig-only claim-grade holdout split. File contains "
+                             "original OB3D timestep indices or frame names; every "
+                             "view at those timesteps is excluded from Gaussian "
+                             "optimization but kept for online pose tracking and "
+                             "post-hoc NVS evaluation.")
+    parser.add_argument('--rig_train_timesteps_file', type=str, default="",
+                        help="Rig-only OB3D train split. When set together with "
+                             "--rig_test_timesteps_file, only these timesteps are "
+                             "used for Gaussian spawn/loss; all other non-test "
+                             "timesteps become tracking-only and are excluded from "
+                             "render metrics.")
     parser.add_argument('--freeze_rig_poses', action='store_true',
                         help="Rig mode: skip the shared rig-pose photometric step "
                              "(trust pose_initializer PnP/miniBA outputs). Diagnostic; "

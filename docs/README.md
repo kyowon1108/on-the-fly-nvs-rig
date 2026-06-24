@@ -9,9 +9,10 @@
    - `rel @ rig`, `rel_t=0`, same-timestep exclusion
    - `enable_reboot`, `test_hold`, `use_colmap_poses`를 그대로 포팅하면 안 되는 이유
 2. [RIG_EVALUATION_PROTOCOL_KO.md](RIG_EVALUATION_PROTOCOL_KO.md)
-   - `--rig_holdout_view`
+   - `--rig_train_timesteps_file` + `--rig_test_timesteps_file` as the OB3D-style claim-grade split
+   - `--rig_holdout_view` as a diagnostic only
    - OB3D GT center ATE
-   - train-view metric과 holdout-view metric 분리
+   - train-view metric과 test-timestep metric 분리
    - 실행 스크립트:
      - `scripts/eval_ob3d_rig_ate.py`
      - `scripts/summarize_rig_render_eval.py`

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Summarize rig post-hoc render metrics by train/holdout split."""
+"""Summarize rig post-hoc render metrics by train/test split."""
 
 from __future__ import annotations
 
@@ -47,17 +47,43 @@ def load_metrics(path: Path) -> dict[str, Any]:
     rows = data.get("per_frame", [])
     if not rows:
         raise ValueError(f"No per_frame rows found in {path}")
-    train_rows = [r for r in rows if not bool(r.get("is_test", False))]
-    holdout_rows = [r for r in rows if bool(r.get("is_test", False))]
+    def split_of(row: dict[str, Any]) -> str:
+        return str(
+            row.get(
+                "rig_eval_split",
+                "test" if bool(row.get("is_test", False)) else "train",
+            )
+        )
+
+    train_rows = [r for r in rows if split_of(r) == "train"]
+    test_rows = [r for r in rows if split_of(r) == "test"]
+    tracking_rows = [r for r in rows if split_of(r) == "tracking"]
     views = sorted({str(r.get("rig_view", "")) for r in rows})
-    holdout_views = sorted({str(r.get("rig_view", "")) for r in holdout_rows})
+    test_views = sorted({str(r.get("rig_view", "")) for r in test_rows})
+    test_timesteps = sorted({
+        int(r["rig_ts"]) for r in test_rows if r.get("rig_ts") is not None
+    })
+    split_meta = data.get("split", {})
+    split_mode = split_meta.get(
+        "mode",
+        "timestep" if len(test_views) == len(views) and test_timesteps else (
+            "view" if test_rows else "none"
+        ),
+    )
+    test_summary = summarize_rows(test_rows)
     return {
         "metrics_path": str(path),
+        "split_mode": split_mode,
         "views": views,
-        "holdout_views": holdout_views,
+        "test_views": test_views,
+        "test_timesteps": test_timesteps,
         "all_views": summarize_rows(rows),
         "train_views": summarize_rows(train_rows),
-        "holdout_views_summary": summarize_rows(holdout_rows),
+        "test_frames": test_summary,
+        "tracking_frames": summarize_rows(tracking_rows),
+        # Backward-compatible key used by older collectors.
+        "holdout_views": test_views,
+        "holdout_views_summary": test_summary,
     }
 
 
@@ -93,12 +119,15 @@ def main() -> None:
     )
     output_path.write_text(json.dumps(summary, indent=2) + "\n")
 
-    holdout = summary["holdout_views_summary"]
+    test = summary["test_frames"]
     train = summary["train_views"]
+    tracking = summary["tracking_frames"]
     print(
         "Rig render split: "
+        f"mode={summary['split_mode']} "
         f"train n={train['num_frames']} PSNR={train['psnr_mean']}, "
-        f"holdout n={holdout['num_frames']} PSNR={holdout['psnr_mean']}"
+        f"test n={test['num_frames']} PSNR={test['psnr_mean']}, "
+        f"tracking n={tracking['num_frames']} excluded"
     )
     print(f"Wrote {output_path}")
 
