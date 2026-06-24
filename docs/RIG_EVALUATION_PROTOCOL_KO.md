@@ -20,10 +20,10 @@ Canonical holdout command:
 ```bash
 python train.py -s /home/kaprub22/otfrig/ob3d_rig/classroom_100 \
   --use_rig --rig_config /home/kaprub22/otfrig/rig12_panosfm.json \
-  --ref_view E+0_A000 --rig_holdout_view E+0_A045 \
+  --ref_view E+0_A000 --rig_holdout_view E+0_A090 \
   --init_focal 200 --fix_focal --downsampling 1 \
   --num_iterations 270 --seed 0 --viewer_mode none \
-  -m results/classroom_holdout_Ep0_A045_seed0
+  -m results/classroom_holdout_Ep0_A090_seed0
 ```
 
 동작:
@@ -67,7 +67,7 @@ python - <<'PY'
 import json, math, statistics as st
 from pathlib import Path
 
-path = Path("results/classroom_holdout_Ep0_A045_seed0/render_eval/metrics.json")
+path = Path("results/classroom_holdout_Ep0_A090_seed0/render_eval/metrics.json")
 d = json.loads(path.read_text())
 for name, rows in {
     "holdout_view": [r for r in d["per_frame"] if r["is_test"]],
@@ -156,7 +156,7 @@ PSNR/SSIM/LPIPS를 사용한다. 따라서 본 rig 논문 표는 다음 구조�
 
 ```bash
 python scripts/eval_ob3d_rig_ate.py \
-  --run results/classroom_holdout_Ep0_A045_seed0 \
+  --run results/classroom_holdout_Ep0_A090_seed0 \
   --gt-centers /home/kaprub22/otfrig/ob3d_rig/classroom_100/gt_centers.json
 ```
 
@@ -169,7 +169,7 @@ python scripts/eval_ob3d_rig_ate.py \
 
 ```bash
 python scripts/summarize_rig_render_eval.py \
-  --run results/classroom_holdout_Ep0_A045_seed0
+  --run results/classroom_holdout_Ep0_A090_seed0
 ```
 
 출력:
@@ -187,7 +187,7 @@ import json
 from pathlib import Path
 import numpy as np
 
-run = Path("results/classroom_holdout_Ep0_A045_seed0")
+run = Path("results/classroom_holdout_Ep0_A090_seed0")
 gt_path = Path("/home/kaprub22/otfrig/ob3d_rig/classroom_100/gt_centers.json")
 meta = json.loads((run / "metadata.json").read_text())
 gt = json.loads(gt_path.read_text())

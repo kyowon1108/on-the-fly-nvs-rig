@@ -23,7 +23,7 @@ COMMON="-s /home/kaprub22/otfrig/ob3d_rig/classroom_100 \
 가능하면 모든 ablation에 같은 holdout view를 추가한다.
 
 ```bash
-COMMON="$COMMON --rig_holdout_view E+0_A045"
+COMMON="$COMMON --rig_holdout_view E+0_A090"
 ```
 
 기록해야 하는 metric:
