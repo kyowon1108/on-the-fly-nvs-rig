@@ -140,6 +140,10 @@ class Keyframe:
         if not only_train:
             self.feat_map = self.feat_map.to(device)
             self.mono_idepth = self.mono_idepth.to(device)
+            # mono_depth_conf is sampled in update_3dpts/sample_conf; if it is
+            # left on cuda while the rest of the keyframe is offloaded, every
+            # offloaded keyframe leaks a [1,1,H,W] tensor of GPU memory.
+            self.mono_depth_conf = self.mono_depth_conf.to(device)
             if self.latest_invdepth is not None:
                 self.latest_invdepth = self.latest_invdepth.to(device)
 
@@ -216,6 +220,8 @@ class Keyframe:
                 mode="bilinear",
                 align_corners=True,
             )[0, 0, 0]
+            if self.mono_depth_conf.device.type != "cuda":
+                self.mono_depth_conf = self.mono_depth_conf.cuda()
             mono_conf = F.grid_sample(
                 self.mono_depth_conf, sampler, mode="bilinear", align_corners=True
             )[0, 0, 0]
@@ -233,6 +239,12 @@ class Keyframe:
         uv, uvs_others, chosen_kfs_ids = self.triangulator.prepare_matches(
             self.desc_kpts
         )
+        # No matches with any other keyframe -> nothing to triangulate. Bail out
+        # before torch.stack([]) (which raises on an empty TensorList).
+        if len(chosen_kfs_ids) == 0:
+            if unload_desc_kpts:
+                self.desc_kpts.to("cpu")
+            return
         Rts_others = torch.stack(
             [all_keyframes[index].get_Rt() for i, index in enumerate(chosen_kfs_ids)],
             dim=0,
@@ -289,6 +301,8 @@ class Keyframe:
 
     @torch.no_grad()
     def sample_conf(self, uv):
+        if self.mono_depth_conf.device.type != "cuda":
+            self.mono_depth_conf = self.mono_depth_conf.cuda()
         return sample(
             self.mono_depth_conf, uv.view(1, 1, -1, 2), self.width, self.height
         )[0, 0, 0]

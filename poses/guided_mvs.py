@@ -39,6 +39,9 @@ class GuidedMVS():
         assert len(keyframes) >= self.n_cams, \
             f"guided_mvs needs >= {self.n_cams} neighbour keyframes, got {len(keyframes)}"
         uv = uv.contiguous()
+        if uv.shape[0] == 0:
+            depth = uv.new_empty(uv.shape[:-1])
+            return depth, torch.empty_like(depth, dtype=torch.bool)
         # Get relative poses
         other2ref = [keyframe.get_Rt() @ torch.linalg.inv(refKeyframe.get_Rt()) for keyframe in keyframes]
         other2ref = torch.stack(other2ref, dim=0)[..., :3, :4].contiguous()

@@ -173,29 +173,9 @@ if __name__ == "__main__":
                     {v: data["frames"][v][2] for v in view_order}
                     for data in bootstrap_rig_data
                 ]
-                # Pre-compute monocular inverse depth per (ts, view) so the rig
-                # bootstrap seeds 3D points with a geometric prior (DA-V2) instead
-                # of unit depth -> wide views (>90 deg off ref) survive (Issue A).
-                # Mono-depth seeding (DA-V2) is OFF by default: A/B + GT-ATE showed
-                # unit-depth >= mono here (bootstrap xyz is discarded, so the seed
-                # only nudges pose-BA convergence -- which unit-depth already does).
-                # --rig_mono_seed re-enables it (uses align_rig_views to reconcile
-                # the per-view DA-V2 scales via shared-centre overlap).
-                mono_idepth_per_ts_per_view = None
-                if args.rig_mono_seed:
-                    mono_idepth_per_ts_per_view = []
-                    for data in bootstrap_rig_data:
-                        view_dict = {}
-                        for v in view_order:
-                            idepth, _ = depth_estimator(data["frames"][v][0])
-                            view_dict[v] = torch.nn.functional.interpolate(
-                                idepth, (height, width), mode="bilinear", align_corners=True,
-                            )
-                        mono_idepth_per_ts_per_view.append(view_dict)
                 rig_Rts, f_out, res, _xyz, _view_names = (
                     pose_initializer.initialize_bootstrap_rig(
                         desc_per_ts_per_view, dataset.rig,
-                        mono_idepth_per_ts_per_view=mono_idepth_per_ts_per_view,
                     )
                 )
                 focal = f_out.cpu().item()
@@ -269,11 +249,23 @@ if __name__ == "__main__":
             # a single view's best prev frames are very different from ref's.
             # update_3dpts=True only on the first call to avoid redundant
             # triangulation across the 9 per-view queries.
+            # update_3dpts=False for ALL views, then refresh each unique prev keyframe
+            # exactly once. The per-view pools diverge (each view picks its own best
+            # matches), so refreshing only the first view's pool (the old `i == 0`)
+            # left views 1..N-1 doing PnP against STALE 3D points -> incremental drift,
+            # worst exactly when the camera turns and pools diverge most. (Fork fix.)
             prev_per_view = {}
-            for i, v in enumerate(view_order):
+            for v in view_order:
                 prev_per_view[v] = scene_model.get_prev_keyframes(
-                    args.num_prev_keyframes_miniba_incr, i == 0, desc_per_view[v],
+                    args.num_prev_keyframes_miniba_incr, False, desc_per_view[v],
                 )
+            seen_prev = set()
+            for prevs in prev_per_view.values():
+                for kf in prevs:
+                    if kf.index in seen_prev:
+                        continue
+                    seen_prev.add(kf.index)
+                    kf.update_3dpts(scene_model.keyframes)
             increment_runtime(runtimes["tri"], start_time)
 
             start_time = time.time()

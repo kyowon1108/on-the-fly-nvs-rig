@@ -12,7 +12,6 @@
 import torch
 import os
 import sys
-import math
 import urllib.request
 import torch.nn.functional as F
 
@@ -102,102 +101,6 @@ def get_t_s(d):
     t = d.median()
     s = (d - t).abs().median()
     return t, s
-
-
-def relative_idepth_to_depth(idepth: torch.Tensor, fallback_depth: float = 1.0) -> torch.Tensor:
-    """DA-V2 returns median/MAD-normalised inverse depth (can be negative; 1/idepth blows
-    up near 0). Shift so the finite min becomes +1.0, then invert -> strictly positive,
-    order-preserving depth. Non-finite entries fall back to fallback_depth. Absolute
-    per-view scale is re-anchored later by bootstrap BA's 0.1 normalisation."""
-    finite_mask = torch.isfinite(idepth)
-    if not finite_mask.any():
-        return torch.full_like(idepth, fallback_depth)
-    idepth_min = idepth[finite_mask].min()
-    depth = 1.0 / (idepth - idepth_min + 1.0)
-    return torch.where(finite_mask, depth, torch.full_like(depth, fallback_depth))
-
-
-def align_rig_views(idepth_dict, rel_R_dict, view_names, ref_view,
-                    f, cx, cy, height, width,
-                    n_lat=64, n_lon=128, min_overlap_bins=15):
-    """Reconcile per-view monocular depth SCALES using the shared-optical-centre
-    overlap between rig views.
-
-    The N rig views share one optical centre (zero baseline, rel_t=0), so the SAME
-    3D point has the SAME radial depth in every view that sees it; two pixels whose
-    rig-frame ray directions coincide are looking at the same point. We bin each
-    view's per-pixel radial depth by ray direction on the sphere, and for every pair
-    of views that share bins we read off the median log-scale offset. A weighted
-    least-squares then solves one multiplicative scale per view (ref_view fixed to 1)
-    so all overlapping rays agree. This removes the per-view scale incoherence of
-    independently-normalised DA-V2 maps (the cause of the wide-view collapse, #5)
-    WITHOUT triangulating (zero baseline gives no new depth, only scale consistency;
-    the common scale stays gauge-free and is re-anchored by the bootstrap's 0.1 norm).
-
-    Returns {view: depth_map (1,1,H,W)} (z-depth) on a common scale. Falls back to the
-    independent per-view depth for any view left unconstrained by the overlap graph.
-
-    Refs: 360MonoDepth (CVPR'22), OmniFusion (CVPR'22) — same tangent-image scale
-    reconciliation; MiDaS scale-shift alignment; H&Z infinite homography K R K^-1."""
-    device = idepth_dict[view_names[0]].device
-    vv, uu = torch.meshgrid(
-        torch.arange(height, device=device, dtype=torch.float32),
-        torch.arange(width, device=device, dtype=torch.float32),
-        indexing="ij",
-    )
-    ray = torch.stack([(uu - cx) / f, (vv - cy) / f, torch.ones_like(uu)], dim=-1)  # (H,W,3)
-    ray_norm = ray.norm(dim=-1)                      # z-depth -> radial-depth factor
-    rayn = (ray / ray_norm[..., None]).reshape(-1, 3)  # unit camera rays (HW,3)
-    nb = n_lat * n_lon
-
-    depth_z, bin_logr, bin_has = {}, {}, {}
-    for v in view_names:
-        dz = relative_idepth_to_depth(idepth_dict[v]).float().reshape(height, width).clamp_min(1e-6)
-        depth_z[v] = dz
-        r = (dz * ray_norm).reshape(-1)              # radial depth (view-invariant up to scale)
-        dirs = (rel_R_dict[v].T @ rayn.T).T          # rig-frame ray dirs (HW,3)
-        lon = torch.atan2(dirs[:, 1], dirs[:, 0])                 # [-pi, pi]
-        lat = torch.atan2(dirs[:, 2], dirs[:, :2].norm(dim=-1))   # [-pi/2, pi/2]
-        bl = ((lon + math.pi) / (2 * math.pi) * n_lon).long().clamp(0, n_lon - 1)
-        bt = ((lat + math.pi / 2) / math.pi * n_lat).long().clamp(0, n_lat - 1)
-        bidx = bt * n_lon + bl                       # (HW,)
-        s = torch.zeros(nb, device=device).scatter_add_(0, bidx, r.log())
-        c = torch.zeros(nb, device=device).scatter_add_(0, bidx, torch.ones_like(r))
-        bin_logr[v] = s / c.clamp_min(1)
-        bin_has[v] = c > 0
-
-    n = len(view_names)
-    rows, targets, weights = [], [], []
-    for a in range(n):
-        for b in range(a + 1, n):
-            common = bin_has[view_names[a]] & bin_has[view_names[b]]
-            k = int(common.sum())
-            if k < min_overlap_bins:
-                continue
-            # align log r_a + x_a == log r_b + x_b  ->  x_a - x_b = median(log r_b - log r_a)
-            delta = torch.median(bin_logr[view_names[b]][common] - bin_logr[view_names[a]][common])
-            row = torch.zeros(n, device=device)
-            row[a], row[b] = 1.0, -1.0
-            rows.append(row); targets.append(delta); weights.append(float(k) ** 0.5)
-
-    ref_i = view_names.index(ref_view) if ref_view in view_names else 0
-    grow = torch.zeros(n, device=device); grow[ref_i] = 1.0           # gauge: x_ref = 0
-    rows.append(grow); targets.append(torch.zeros((), device=device)); weights.append(1e3)
-
-    w = torch.tensor(weights, device=device)
-    A = torch.stack(rows) * w[:, None]
-    d = torch.stack(targets) * w
-    x = torch.linalg.lstsq(A, d).solution
-    if not torch.isfinite(x).all():
-        x = torch.zeros(n, device=device)            # degenerate graph -> no rescale
-    scales = torch.exp((x - x[ref_i]).clamp(-5, 5))   # ref scale = 1; guard runaway
-
-    if os.environ.get("OTF_DEBUG_BOOT"):
-        print(f"[align_rig_views] per-view scales = "
-              f"{ {view_names[i]: round(float(scales[i]), 3) for i in range(n)} }")
-
-    return {v: (depth_z[v] * scales[i]).reshape(1, 1, height, width)
-            for i, v in enumerate(view_names)}
 
 
 def align_samples(tri_idepth: torch.Tensor, mono_idepth: torch.Tensor):

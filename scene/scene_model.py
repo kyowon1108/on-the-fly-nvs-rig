@@ -46,6 +46,7 @@ from utils import (
     make_torch_sampler,
     psnr,
     rotation_distance,
+    sixD2mtx,
 )
 from dataloaders.read_write_model import write_model
 
@@ -621,7 +622,24 @@ class SceneModel:
         return closest_anchors, closest_anchors_ids
 
     @torch.no_grad()
-    def get_prev_keyframes(self, n: int, update_3dpts: bool, desc_kpts: DescribedKeypoints = None, exclude_ts: int = None):
+    def get_live_rig_centres(self):
+        """Return one live camera centre per rig timestep.
+
+        In the rotation-only rig, all views in a timestep share the same optical
+        centre:
+            C_view = -(R_rel R_rig)^T (R_rel t_rig) = -R_rig^T t_rig.
+        Computing this once per timestep avoids calling Keyframe.get_centre() for
+        every view/keyframe candidate during neighbour selection.
+        """
+        if len(self.rig_R6D) == 0:
+            return torch.empty(0, 3, device="cuda")
+        rig_R6D = torch.stack([p.detach() for p in self.rig_R6D], dim=0)
+        rig_t = torch.stack([p.detach() for p in self.rig_t], dim=0)
+        rig_R = sixD2mtx(rig_R6D)
+        return -(rig_R.transpose(1, 2) @ rig_t[..., None]).squeeze(-1)
+
+    @torch.no_grad()
+    def get_prev_keyframes(self, n: int, update_3dpts: bool, desc_kpts: DescribedKeypoints = None, exclude_ts: int = None, target_centre: torch.Tensor = None):
         """
         Get the n previous keyframes that are the closest to the last
         If desc_kpts is not None, we find the previous keyframes that have the most matches with desc_kpts. The search window is given by self.num_prev_keyframes_check
@@ -631,11 +649,25 @@ class SceneModel:
         MVS partners yields degenerate depth (conventions §7). They are the nearest
         neighbours by camera-center distance, so a post-hoc filter would leave none —
         the exclusion must happen on the candidate pool.
+        If target_centre is given, neighbours are sorted by distance to THAT live
+        camera centre instead of the cached global sorted_frame_indices (which is
+        keyed to the LAST-added keyframe's *initial* pose). For spawning Gaussians
+        from a non-last keyframe — or any keyframe whose pose moved during
+        photometric optimization — the global order picks the wrong neighbours,
+        causing bootstrap/reboot/non-last-spawn order dependence.
         """
         # Make sure the optimization thread is not running
         self.join_optimization_thread()
 
-        candidate_idx = self.sorted_frame_indices
+        if target_centre is not None:
+            # Candidate pool = ALL keyframes; we re-sort by live-centre distance
+            # AFTER the holdout / same-ts filters below, recomputing each
+            # candidate's centre from its CURRENT pose (not approx_cam_centres,
+            # which is keyed to initial poses). Sorting the cached centres would
+            # leave live-target vs stale-candidates — only a half fix.
+            candidate_idx = torch.arange(len(self.keyframes), dtype=torch.long)
+        else:
+            candidate_idx = self.sorted_frame_indices
         if self.use_rig:
             # Holdout/test keyframes must never be triangulation / MVS / PnP
             # partners: their geometry would leak into the poses & depths of the
@@ -655,9 +687,41 @@ class SceneModel:
             )
             candidate_idx = candidate_idx[keep]
 
+        # (rig) Now that holdout/same-ts candidates are removed, sort the survivors
+        # by distance to the TARGET keyframe's LIVE centre. For rig keyframes the
+        # live centre is view-independent, so compute it in one batched pass per
+        # timestep and index by each candidate's ts_idx instead of calling
+        # Keyframe.get_centre() once per candidate.
+        if target_centre is not None and len(candidate_idx) > 0:
+            if self.use_rig and len(self.rig_R6D) > 0:
+                centres_ts = self.get_live_rig_centres()
+                candidate_ts_idx = torch.tensor(
+                    [self.keyframes[int(i)].ts_idx for i in candidate_idx],
+                    dtype=torch.long,
+                    device=centres_ts.device,
+                )
+                centres = centres_ts[candidate_ts_idx]
+            else:
+                centres = torch.stack(
+                    [self.keyframes[int(i)].get_centre().detach() for i in candidate_idx],
+                    dim=0,
+                )
+            target = target_centre.detach().to(centres)
+            order = torch.argsort(
+                torch.linalg.vector_norm(centres - target[None], dim=-1)
+            )
+            candidate_idx = candidate_idx[order.cpu()]
+
         # Look for the previous keyframes with the most matches with desc_kpts (if provided)
         if desc_kpts is not None and len(candidate_idx) >= n:
-            n_ckecks = min(self.num_prev_keyframes_check, len(candidate_idx))
+            # N-view scaling: the candidate pool is the closest-by-center keyframes, but
+            # for an N-view rig each timestep contributes N keyframes at the SAME center,
+            # so a fixed window only spans ~window/N timesteps and yields ~window/N
+            # same-view candidates per view — starving the per-view match selection and
+            # causing incremental pose drift. Scale the pool by N so each view sees a
+            # mono-equivalent number of same-view keyframes.
+            check_window = self.num_prev_keyframes_check * (self.n_rig_views if self.use_rig else 1)
+            n_ckecks = min(check_window, len(candidate_idx))
             keyframes_indices_to_check = candidate_idx[:n_ckecks]
             n_matches = torch.zeros(len(keyframes_indices_to_check), device="cuda")
             for i, index in enumerate(keyframes_indices_to_check):
@@ -728,6 +792,11 @@ class SceneModel:
         if keyframe.info["is_test"]:
             return
 
+        # Live camera centre of the TARGET keyframe (from its current pose, not the
+        # cached approx_centre keyed to the initial pose). Used for MVS-neighbour
+        # selection, Gaussian scale, and the huge-Gaussian prune below.
+        cam_centre = keyframe.get_centre().detach()
+
         ## Get the pixel-wise probability to add a Gaussian
         img = keyframe.image_pyr[0]
         img = F.avg_pool2d(img, 2)
@@ -760,36 +829,55 @@ class SceneModel:
         sample_mask = torch.rand_like(init_proba) < init_proba - penalty # eq. 3
 
         sampled_uv = self.uv[sample_mask]
-        ## Initialize positions
-        # Get the samples' depth with guided stereo matching
-        prev_KFs = self.get_prev_keyframes(
-            self.guided_mvs.n_cams + 1, update_3dpts=False,
-            exclude_ts=keyframe.info.get("rig_ts"),
-        )
-        for i, prev_keyframe in enumerate(prev_KFs):
-            if keyframe.index == prev_keyframe.index:
-                prev_KFs.pop(i)
-                break
-        # (rig) same-ts exclusion safety net: prev_KFs must never share this
-        # keyframe's rig timestamp (zero baseline -> degenerate depth).
-        _ex_ts = keyframe.info.get("rig_ts")
-        if _ex_ts is not None:
-            assert all(p.info.get("rig_ts") != _ex_ts for p in prev_KFs), \
-                "zero-baseline same-ts keyframe leaked into guided_mvs partners"
-        # guided_mvs' CUDA kernel is compiled for a fixed NUM_CAMS = n_cams and
-        # indexes exactly that many neighbours: passing FEWER reads out of bounds
-        # (garbage depth / crash). After same-ts/holdout exclusion the cross-ts
-        # pool can fall below n_cams (small bootstrap B, heavy offload) -> skip
-        # spawn for this keyframe rather than feed a short list. (>= n_cams is
-        # fine; the kernel just uses the first n_cams.)
-        if len(prev_KFs) < self.guided_mvs.n_cams:
-            return
-        depth, accurate_mask = self.guided_mvs(sampled_uv, keyframe, prev_KFs)
-        valid_mask = (keyframe.sample_conf(sampled_uv) > 0.5) * (depth > 1e-6)
-        sample_mask[sample_mask.clone()] = valid_mask
-        depth = depth[valid_mask]
-        sampled_uv = sampled_uv[valid_mask]
-        accurate_mask = accurate_mask[valid_mask]
+        # The guided-MVS branch needs selected pixels AND enough cross-ts
+        # neighbours. If either is missing we skip ONLY the MVS branch (a CUDA-
+        # launch crash guard: grid_size = ceil(0) = 0) — the triangulated match
+        # Gaussians below are still spawned. mvs_pts/depth/accurate_mask stay
+        # empty and the downstream concatenations remain correct.
+        mvs_pts = torch.empty(0, 3, device="cuda")
+        depth = torch.empty(0, device="cuda")
+        accurate_mask = torch.empty(0, dtype=torch.bool, device="cuda")
+        run_mvs = sampled_uv.numel() > 0
+        if run_mvs:
+            ## Initialize positions
+            # Get the samples' depth with guided stereo matching.
+            # Neighbour selection uses the TARGET keyframe's live centre (not the
+            # global sorted_frame_indices keyed to the last-added keyframe's initial
+            # pose) so spawning from a non-last keyframe — bootstrap, reboot, or any
+            # rig view — picks the geometrically correct MVS partners.
+            prev_KFs = self.get_prev_keyframes(
+                self.guided_mvs.n_cams + 1, update_3dpts=False,
+                exclude_ts=keyframe.info.get("rig_ts"),
+                target_centre=cam_centre,
+            )
+            for i, prev_keyframe in enumerate(prev_KFs):
+                if keyframe.index == prev_keyframe.index:
+                    prev_KFs.pop(i)
+                    break
+            # (rig) same-ts exclusion safety net: prev_KFs must never share this
+            # keyframe's rig timestamp (zero baseline -> degenerate depth).
+            _ex_ts = keyframe.info.get("rig_ts")
+            if _ex_ts is not None:
+                assert all(p.info.get("rig_ts") != _ex_ts for p in prev_KFs), \
+                    "zero-baseline same-ts keyframe leaked into guided_mvs partners"
+            # guided_mvs' CUDA kernel is compiled for a fixed NUM_CAMS = n_cams and
+            # indexes exactly that many neighbours: passing FEWER reads out of bounds.
+            # If the cross-ts pool is too small, skip only the MVS branch (keep match
+            # Gaussians) rather than discarding the whole keyframe.
+            if len(prev_KFs) < self.guided_mvs.n_cams:
+                run_mvs = False
+        if run_mvs:
+            depth, accurate_mask = self.guided_mvs(sampled_uv, keyframe, prev_KFs)
+            valid_mask = (keyframe.sample_conf(sampled_uv) > 0.5) * (depth > 1e-6)
+            sample_mask[sample_mask.clone()] = valid_mask
+            depth = depth[valid_mask]
+            sampled_uv = sampled_uv[valid_mask]
+            accurate_mask = accurate_mask[valid_mask]
+        else:
+            # No MVS samples: zero the pixel mask so all the sample_mask-indexed
+            # ops below become empty (match Gaussians are unaffected).
+            sample_mask.zero_()
+            sampled_uv = sampled_uv[:0]
 
         # Remove Gaussians that are coarser than the newpoints
         if len(self.xyz) > 0:
@@ -818,12 +906,15 @@ class SceneModel:
             sampled_uv = sampled_uv[valid_mask]
             accurate_mask = accurate_mask[valid_mask]
 
-        # Get the samples' 3D positions
-        new_pts = depth2points(sampled_uv, depth.unsqueeze(-1), self.f, self.centre)
-        new_pts = (new_pts - keyframe.get_t()) @ keyframe.get_R()
-        # Add points from matching
+        # Get the samples' 3D positions (MVS branch only if we have valid samples)
+        if sampled_uv.shape[0] > 0:
+            mvs_pts = depth2points(sampled_uv, depth.unsqueeze(-1), self.f, self.centre)
+            mvs_pts = (mvs_pts - keyframe.get_t()) @ keyframe.get_R()
+        # Add points from matching (these survive even when MVS was skipped)
         match_pts = keyframe.desc_kpts.pts3d[keyframe.desc_kpts.has_pt3d]
-        new_pts = torch.cat([new_pts, match_pts], dim=0)
+        if mvs_pts.shape[0] == 0 and match_pts.shape[0] == 0:
+            return
+        new_pts = torch.cat([mvs_pts, match_pts], dim=0)
 
         ## Initialize Colour
         f_dc = img[:, sample_mask]
@@ -853,7 +944,7 @@ class SceneModel:
         # Scale by the distance to the camera centre
         scales.mul_(1 / self.f)
         scales *= torch.linalg.vector_norm(
-            new_pts - keyframe.approx_centre[None], dim=-1
+            new_pts - cam_centre[None], dim=-1
         )
         scales = torch.log(scales.clamp(1e-6, 1e6)).unsqueeze(-1).repeat(1, 3)
 
@@ -884,7 +975,7 @@ class SceneModel:
 
             # Discard huge Gaussians
             dist = torch.linalg.vector_norm(
-                self.xyz - keyframe.approx_centre[None], dim=-1
+                self.xyz - cam_centre[None], dim=-1
             )
             screen_size = self.f * self.scaling.max(dim=-1)[0] / dist
             valid_gs_mask *= screen_size < 0.5 * self.width
@@ -1013,8 +1104,12 @@ class SceneModel:
             self.active_anchor.add_keyframe(keyframe)
             self.active_frames_gpu.append(keyframe.index)
 
-            ## Clear memory if there are many keyframes
-            if len(self.active_frames_gpu) > self.max_active_keyframes:
+            ## Clear memory if there are many keyframes. N-view scaling: a rig adds N
+            ## keyframes per timestep, so a fixed cap offloads after only cap/N timesteps
+            ## (excessive CPU<->GPU churn at high N / long sequences). Scale by N so the
+            ## GPU-residency window is measured in timesteps, like n_kept_frames.
+            max_active = self.max_active_keyframes * (self.n_rig_views if self.use_rig else 1)
+            if len(self.active_frames_gpu) > max_active:
                 self.move_rand_keyframe_to_cpu()
                 # Reshuffle the active keyframes and clear cache
                 if len(self.active_frames_cpu) % 5 == 0:

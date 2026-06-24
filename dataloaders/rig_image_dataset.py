@@ -35,6 +35,22 @@ class RigImageDataset:
         self.source_path = args.source_path
         self.images_root = os.path.join(args.source_path, args.images_dir)
 
+        # Optional per-view mask tree (mirrors images/<view>/<frame>). Only
+        # activated if --masks_dir is set AND the directory actually exists, so
+        # current rig runs (no masks/) are unaffected. Masks are applied to the
+        # loss/eval/spawn exactly like the single-camera ImageDataset path.
+        # Fail-closed: if the user asked for masks, a missing dir is an error, not
+        # a silent mask-OFF (which would leave them thinking masks are active).
+        masks_dir = getattr(args, "masks_dir", "") or ""
+        self.masks_root = ""
+        if masks_dir:
+            masks_root = os.path.join(args.source_path, masks_dir)
+            if not os.path.isdir(masks_root):
+                raise FileNotFoundError(
+                    f"--masks_dir was set ({masks_dir!r}) but not found: {masks_root}"
+                )
+            self.masks_root = masks_root
+
         # Auto-load focal from the extraction step's metadata so a forgotten
         # --init_fov can't silently produce a wrong reconstruction. The
         # extraction script (eqr_to_pinhole.py) is the source of truth.
@@ -46,6 +62,17 @@ class RigImageDataset:
             print(
                 f"[rig] auto-loaded init_focal={args.init_focal:.1f} "
                 f"from {meta_path}"
+            )
+        elif not os.path.exists(meta_path) and args.init_focal < 0 and args.init_fov < 0:
+            # Without extraction_meta.json the focal can only fall back to
+            # 0.7*width, which for the OB3D-rig pinhole crop is wildly wrong and
+            # silently corrupts the reconstruction. Force the user to pass the
+            # known intrinsic explicitly rather than guessing.
+            raise FileNotFoundError(
+                f"[rig] no extraction_meta.json at {meta_path} and neither "
+                "--init_focal nor --init_fov was given. Pass the pinhole focal "
+                "explicitly (e.g. --init_focal <fx_pixels> or --init_fov <deg>); "
+                "the 0.7*width fallback is not valid for the rig crop."
             )
 
         # Load rig geometry (relative Rt per view, in COLMAP world-to-camera convention).
@@ -164,11 +191,47 @@ class RigImageDataset:
         item = self.items[index]
         image = self._load_image(item["path"], cv2.IMREAD_UNCHANGED)
         key = _frame_key(item["view"], item["ts"])
-        info = self.infos[key]
+        # Return a shallow copy so per-frame mutations (mask, ts_idx set later by
+        # train.py) don't accumulate on the shared self.infos[key] dict.
+        info = dict(self.infos[key])
         if image.shape[0] == 4:
             info["mask"] = image[-1][None].cpu()
             image = image[:3]
+        if self.masks_root:
+            info["mask"] = self._load_mask(item["view"], item["filename"])
         return image.cuda(), info
+
+    def _load_mask(self, view: str, filename: str):
+        """Load the per-view mask matching images/<view>/<filename>, downsampled
+        the same way as the image. Returns a [1, H, W] float tensor in {0,1} on
+        CPU. Raises if no mask file is found (fail-closed: masks were requested).
+        Tries a few naming conventions (the OB3D-rig export uses
+        masks/<view>/<filename>.png, i.e. a doubled extension like
+        frame_000000.png.png)."""
+        view_dir = os.path.join(self.masks_root, view)
+        stem = os.path.splitext(filename)[0]
+        candidates = [
+            os.path.join(view_dir, stem + ".png"),
+            os.path.join(view_dir, filename),
+            os.path.join(view_dir, filename + ".png"),
+        ]
+        mask_path = next((p for p in candidates if os.path.exists(p)), None)
+        if mask_path is None:
+            raise FileNotFoundError(
+                f"No rig mask found for view={view}, filename={filename}; "
+                f"tried: {candidates}"
+            )
+        mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        if mask is None:
+            raise FileNotFoundError(f"Rig mask at {mask_path} could not be loaded.")
+        if self.downsampling > 0.0 and self.downsampling != 1.0:
+            mask = cv2.resize(
+                mask, (0, 0),
+                fx=1 / self.downsampling, fy=1 / self.downsampling,
+                interpolation=cv2.INTER_AREA,
+            )
+        mask = torch.from_numpy(mask).float()[None] / 255.0
+        return mask
 
     def _load_image(self, image_path: str, mode: int = cv2.IMREAD_COLOR):
         image = cv2.imread(image_path, mode)

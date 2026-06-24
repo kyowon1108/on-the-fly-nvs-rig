@@ -68,8 +68,13 @@ def load_rig_config(config_path: str, ref_view: str = "High_Cam07",
                                               device=device)
 
     if ref_view not in quats:
-        raise ValueError(f"ref_view {ref_view!r} not found in rig config "
-                         f"(available: {order})")
+        raise ValueError(
+            f"--ref_view {ref_view!r} not found in rig config {config_path!r}. "
+            f"Available views: {order}. "
+            f"(The default --ref_view is 'High_Cam07' for the Insta360 rig; for "
+            f"OB3D-rig configs like rig12_panosfm.json pass e.g. "
+            f"--ref_view E+0_A000.)"
+        )
 
     ref_R_w2c = _blender_quat_to_world2cam(quats[ref_view])
 
