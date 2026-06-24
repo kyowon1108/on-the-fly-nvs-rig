@@ -18,8 +18,8 @@ train-view PSNR은 optimization self-render라서 generalization metric이 아�
 Canonical holdout command:
 
 ```bash
-python train.py -s /home/kaprub22/otfrig/ob3d_rig/classroom_100 \
-  --use_rig --rig_config /home/kaprub22/otfrig/rig12_panosfm.json \
+python train.py -s /home/kaprub22/otfrig/pinhole_rig/ob3d_rig/classroom_100 \
+  --use_rig --rig_config /home/kaprub22/otfrig/tools/configs/rig12_panosfm.json \
   --ref_view E+0_A000 --rig_holdout_view E+0_A090 \
   --init_focal 200 --fix_focal --downsampling 1 \
   --num_iterations 270 --seed 0 --viewer_mode none \
@@ -157,7 +157,7 @@ PSNR/SSIM/LPIPS를 사용한다. 따라서 본 rig 논문 표는 다음 구조�
 ```bash
 python scripts/eval_ob3d_rig_ate.py \
   --run results/classroom_holdout_Ep0_A090_seed0 \
-  --gt-centers /home/kaprub22/otfrig/ob3d_rig/classroom_100/gt_centers.json
+  --gt-centers /home/kaprub22/otfrig/pinhole_rig/ob3d_rig/classroom_100/gt_centers.json
 ```
 
 출력:
@@ -188,7 +188,7 @@ from pathlib import Path
 import numpy as np
 
 run = Path("results/classroom_holdout_Ep0_A090_seed0")
-gt_path = Path("/home/kaprub22/otfrig/ob3d_rig/classroom_100/gt_centers.json")
+gt_path = Path("/home/kaprub22/otfrig/pinhole_rig/ob3d_rig/classroom_100/gt_centers.json")
 meta = json.loads((run / "metadata.json").read_text())
 gt = json.loads(gt_path.read_text())
 

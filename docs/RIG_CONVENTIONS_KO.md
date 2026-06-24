@@ -88,8 +88,8 @@ $$
 Canonical command:
 
 ```bash
-python train.py -s /home/kaprub22/otfrig/ob3d_rig/classroom_100 \
-  --use_rig --rig_config /home/kaprub22/otfrig/rig12_panosfm.json \
+python train.py -s /home/kaprub22/otfrig/pinhole_rig/ob3d_rig/classroom_100 \
+  --use_rig --rig_config /home/kaprub22/otfrig/tools/configs/rig12_panosfm.json \
   --ref_view E+0_A000 --init_focal 200 --fix_focal \
   --downsampling 1 --num_keyframes_miniba_bootstrap 8 \
   --num_iterations 270 --seed 0 --viewer_mode none \
