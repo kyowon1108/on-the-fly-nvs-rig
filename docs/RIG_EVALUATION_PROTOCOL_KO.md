@@ -150,10 +150,36 @@ PSNR/SSIM/LPIPS를 사용한다. 따라서 본 rig 논문 표는 다음 구조�
   구현해야 한다.
 - train-view PSNR은 appendix diagnostic으로만 둔다.
 
-## 6. 실행 스니펫: ATE
+## 6. 실행 스크립트
 
-현재 repo에 고정 evaluator script가 없으면 아래 스니펫으로 계산하고, 이후
-`scripts/eval_ob3d_rig_ate.py`로 승격한다.
+### 6.1 OB3D rig-center ATE
+
+```bash
+python scripts/eval_ob3d_rig_ate.py \
+  --run results/classroom_holdout_Ep0_A045_seed0 \
+  --gt-centers /home/kaprub22/otfrig/ob3d_rig/classroom_100/gt_centers.json
+```
+
+출력:
+
+- stdout: timestep 수, ATE meter, ATE %span, same-timestep spread max
+- JSON: `results/<run>/ate_ob3d_rig.json`
+
+### 6.2 Train-view / holdout-view render split
+
+```bash
+python scripts/summarize_rig_render_eval.py \
+  --run results/classroom_holdout_Ep0_A045_seed0
+```
+
+출력:
+
+- stdout: train/holdout frame 수와 PSNR 요약
+- JSON: `results/<run>/render_eval/split_metrics.json`
+
+## 7. Reference implementation: ATE formula
+
+`scripts/eval_ob3d_rig_ate.py`는 아래 계산을 고정 구현으로 둔다.
 
 ```bash
 python - <<'PY'
@@ -211,7 +237,7 @@ print("Sim3_scale_est_to_gt", float(scale))
 PY
 ```
 
-## 7. 외부 기준
+## 8. 외부 기준
 
 - OB3D dataset/protocol: https://arxiv.org/html/2505.20126v1
 - OB3D GitHub evaluation code: https://github.com/gsisaoki/Omnidirectional_Blender_3D_Dataset

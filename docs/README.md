@@ -12,6 +12,9 @@
    - `--rig_holdout_view`
    - OB3D GT center ATE
    - train-view metric과 holdout-view metric 분리
+   - 실행 스크립트:
+     - `scripts/eval_ob3d_rig_ate.py`
+     - `scripts/summarize_rig_render_eval.py`
 3. [RIG_ABLATION_PLAN_KO.md](RIG_ABLATION_PLAN_KO.md)
    - default / `--freeze_rig_poses`
    - `--depth_loss_weight_init 0`
