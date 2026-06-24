@@ -323,10 +323,9 @@ class SceneModel:
         l1_loss = (image - gt_image).abs().mean()
         ssim_loss = 1 - fused_ssim(image[None], gt_image[None])
         depth_loss = (invdepth - mono_idepth).abs().mean()
-        # NOTE: do NOT set depth_loss_weight to 0. Even though mono depth's
-        # absolute scale is off, it acts as an ordinal prior that stabilizes
-        # Gaussian depth ordering. weight=0 -> PSNR -0.58, ATE 12-18x worse
-        # (verified 2026-04-16, "Fix 2" attempt).
+        # Mono depth has the wrong absolute scale, but still acts as an ordinal
+        # prior for Gaussian depth ordering. Its causal role is measured by the
+        # documented `--depth_loss_weight_init 0` ablation, not assumed here.
         loss = (
             self.lambda_dssim * ssim_loss
             + (1 - self.lambda_dssim) * l1_loss
@@ -1299,10 +1298,6 @@ class SceneModel:
             self.gaussian_params = anchor.gaussian_params
             self.anchor_weights[anchor_id] = 1
             self.reset_optimizer()
-
-            # # Ensure other anchors are on cpu to save memory
-            # if anchor_id >= 1:
-            #     self.anchors[anchor_id-1].to("cpu", with_keyframes=True)
 
             # Optimize the anchor by going through its keyframes
             for _ in range(len(anchor.keyframes)):

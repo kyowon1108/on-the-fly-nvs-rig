@@ -1,11 +1,11 @@
-"""Rig-aware image dataset for the 9-view Insta360 X5 rig.
+"""Rig-aware image dataset for an N-view zero-baseline virtual rig.
 
-Each timestep emits one interleaved 9-view batch: the reference view first, then
-the remaining 8 non-ref views in a fixed order (the order they appear in
-`rig_config.view_names`). The training loop pulls a whole timestep at once and
-estimates a single shared rig pose for it; each frame carries its fixed
-`rig_relative_Rt` in `info`, and per-view poses are derived as rel @ rig (no PnP
-per view, rel_t=0). `start_at` is in timestep units (not per-image).
+Each timestep emits one interleaved N-view batch: the reference view first, then
+the remaining non-ref views in the order they appear in `rig_config.view_names`.
+The training loop pulls a whole timestep at once and estimates a single shared
+rig pose for it; each frame carries its fixed `rig_relative_Rt` in `info`, and
+per-view poses are derived as rel @ rig (no independent per-view pose, rel_t=0).
+`start_at` is in timestep units (not per-image).
 """
 
 import json
@@ -29,7 +29,7 @@ def _frame_key(view: str, ts: int) -> str:
 
 
 class RigImageDataset:
-    """Two-pass iterator over a 9-view rig directory."""
+    """Two-pass iterator over an N-view rig directory."""
 
     def __init__(self, args: Namespace):
         self.source_path = args.source_path
@@ -97,9 +97,8 @@ class RigImageDataset:
         self.ts_index = {name: i for i, name in enumerate(self.timestep_names)}
         self.num_timesteps = len(self.timestep_names)
 
-        # Iteration order (rig Option A): every timestep emits a 9-view batch,
-        # ref first, non-ref in fixed order. train.py pulls one ref frame and
-        # the following 8 non-ref frames together.
+        # Iteration order: every timestep emits a full N-view batch, ref first,
+        # non-ref in fixed rig order. train.py consumes the whole batch together.
         self.items: List[dict] = []
         for fname in self.timestep_names:
             ts = self.ts_index[fname]
@@ -112,7 +111,7 @@ class RigImageDataset:
                                    "filename": fname})
 
         # start_at is in *timestep* units for rig mode (vs per-image in the
-        # single-camera dataset). Drop the first N full 9-view batches and
+        # single-camera dataset). Drop the first N full rig batches and
         # shrink timestep_names accordingly so train.py's
         # `dataset.num_timesteps` reflects the remaining iterations.
         if args.start_at > 0:

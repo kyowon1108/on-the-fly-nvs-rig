@@ -82,7 +82,7 @@ class Keyframe:
         # throughout photometric optimization (the rotation-only rig invariant).
         # The optimizable rig pose is owned by scene_model.rig_optimizer
         # (register_rig_poses / append_rig_pose). Per-view independent pose
-        # optimization would let the 9 views drift apart and break the rig.
+        # optimization would let the N views drift apart and break the rig.
         self.rig_view = info.get("rig_view", None)
         self.ts_idx = info.get("ts_idx", None)
         self.is_rig_mode = (self.rig_view is not None and self.ts_idx is not None)

@@ -58,7 +58,7 @@ class PoseInitializer():
         
         self.PnPRANSAC = RANSACEstimator(args.pnpransac_samples, self.max_pnp_error, EstimatorType.P4P)
 
-        # Rig-aware MiniBA for bootstrap (Option A, TODO §3.3.1).
+        # Rig-aware MiniBA for bootstrap over shared per-timestep poses.
         self.rig_config = rig_config
         if rig_config is not None:
             self._rig_view_names = list(rig_config.view_names)
@@ -75,7 +75,7 @@ class PoseInitializer():
                 optimize_3Dpts=True,
                 iters=args.iters_miniba_bootstrap,
             )
-            # Issue #5 refinement: 1-timestep MiniBARig for per-step rig_pose
+            # Optional 1-timestep MiniBARig refinement for per-step rig_pose
             # refinement after rig_pnp_per_view. Pose-only (3D pts fixed).
             self._rig_incr_npts = (args.num_pts_miniba_incr // n_views) * n_views
             self.miniba_incr_rig = MiniBARig(
@@ -322,11 +322,11 @@ class PoseInitializer():
 
     @torch.no_grad()
     def initialize_bootstrap_rig(self, desc_kpts_per_ts_per_view, rig_config):
-        """Rig-aware bootstrap (Option A, TODO §3.3.1).
+        """Rig-aware bootstrap for an N-view zero-baseline virtual rig.
 
         Args:
             desc_kpts_per_ts_per_view: list length N_ts of dict
-                {view_name: DescribedKeypoints}. All 9 views present per ts.
+                {view_name: DescribedKeypoints}. All rig views present per ts.
             rig_config: RigConfig with fixed relative_Rt per view.
 
         Returns:
@@ -347,7 +347,7 @@ class PoseInitializer():
         def make_kID(v_idx, ts):
             return ts * N_views + v_idx
 
-        # Time-axis exhaustive matching within each view — TODO.md §3.3.1.
+        # Time-axis exhaustive matching within each view.
         # Cross-view matching is intentionally skipped (rotation-only rig has
         # zero baseline intra-timestep, so cross-view matches carry no depth info).
         for v_idx, v_name in enumerate(view_names):
@@ -468,7 +468,7 @@ class PoseInitializer():
         view_indices,
         rig_config,
     ):
-        """Rig-aware incremental pose using method A from TODO §3.3.2.
+        """Rig-aware incremental pose from per-view PnP candidates.
 
         Each view is matched independently against the previous keyframes;
         per-view 2D-3D correspondences are fed to `rig_pnp_per_view`, which
@@ -547,9 +547,9 @@ class PoseInitializer():
                     keyframe.desc_kpts.matches.pop(my_idx, None)
             return None, stats
 
-        # Issue #5: refine rig_pose with 1-timestep MiniBARig LM (pose-only).
+        # Refine rig_pose with 1-timestep MiniBARig LM (pose-only).
         # Takes PnP+Fréchet mean output as initial guess, tightens it with
-        # full reprojection residual across all 9 views simultaneously.
+        # full reprojection residual across all rig views simultaneously.
         if hasattr(self, "miniba_incr_rig"):
             self._refine_call_count += 1
             try:

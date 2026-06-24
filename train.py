@@ -99,7 +99,7 @@ if __name__ == "__main__":
     needs_reboot = False
     bootstrap_keyframe_dicts = []
     bootstrap_desc_kpts = []
-    # Rig mode (Option A): one 9-view batch per timestep; the first B batches
+    # Rig mode: one N-view batch per timestep; the first B batches
     # accumulate for rig bootstrap, then each subsequent batch is handled by
     # rig-aware incremental PnP. `ref_kf_by_ts[ts]` caches the ref-view keyframe
     # for debugging / downstream inspection.
@@ -114,7 +114,7 @@ if __name__ == "__main__":
 
     ## Scene reconstruction
     print(f"Starting reconstruction for {args.source_path}")
-    # In rig mode each loop iteration consumes 9 images (one 9-view batch),
+    # In rig mode each loop iteration consumes N images (one full rig batch),
     # so the tqdm range must be in batches rather than individual images.
     total_iters = (
         dataset.num_timesteps if args.use_rig else len(dataset)
@@ -139,7 +139,7 @@ if __name__ == "__main__":
                 viewer.trainer_state = "finish"
                 break
         
-        # === Rig mode (Option A): one 9-view batch per timestep ===
+        # === Rig mode: one N-view batch per timestep ===
         if args.use_rig:
             image, info = dataset.getnext()
             if info["rig_view"] != dataset.ref_view:
@@ -167,7 +167,7 @@ if __name__ == "__main__":
                 if n_rig_bootstrap_ts < B:
                     continue
 
-                # --- Rig bootstrap: run MiniBARig over B timesteps * 9 views ---
+                # --- Rig bootstrap: run MiniBARig over B timesteps * N views ---
                 start_time = time.time()
                 desc_per_ts_per_view = [
                     {v: data["frames"][v][2] for v in view_order}
@@ -182,7 +182,7 @@ if __name__ == "__main__":
                 increment_runtime(runtimes["BAB"], start_time)
 
                 # (rig) Hand the bootstrap rig poses to the photometric optimizer:
-                # it now OWNS one shared 9-DoF pose per ts; the 9 view poses are
+                # it now OWNS one shared 9-DoF pose per ts; the N view poses are
                 # derived as rel @ rig (rel_t=0) and stay rigidly co-centered.
                 rig_R6D_init = mtx2sixD(rig_Rts[:, :3, :3].contiguous())
                 rig_t_init = rig_Rts[:, :3, 3].contiguous()
@@ -214,7 +214,7 @@ if __name__ == "__main__":
                         n_keyframes += 1
                 increment_runtime(runtimes["Add"], start_time)
 
-                # Gaussian initialization from ALL 9 views (was: ref only).
+                # Gaussian initialization from all N views (was: ref only).
                 # Each view's desc_kpts.pts3d is filled in by update_3dpts()
                 # inside add_new_gaussians via its own time-axis matches that
                 # bootstrap_rig has already generated. add_new_gaussians also
@@ -248,12 +248,12 @@ if __name__ == "__main__":
             # based on its own features. Critical for U-turn handling, where
             # a single view's best prev frames are very different from ref's.
             # update_3dpts=True only on the first call to avoid redundant
-            # triangulation across the 9 per-view queries.
+            # triangulation across the N per-view queries.
             # update_3dpts=False for ALL views, then refresh each unique prev keyframe
             # exactly once. The per-view pools diverge (each view picks its own best
-            # matches), so refreshing only the first view's pool (the old `i == 0`)
+            # matches), so refreshing only the first view's pool
             # left views 1..N-1 doing PnP against STALE 3D points -> incremental drift,
-            # worst exactly when the camera turns and pools diverge most. (Fork fix.)
+            # worst exactly when the camera turns and pools diverge most.
             prev_per_view = {}
             for v in view_order:
                 prev_per_view[v] = scene_model.get_prev_keyframes(
@@ -298,7 +298,7 @@ if __name__ == "__main__":
                 scene_model.add_keyframe(kf)
                 if v_name == dataset.ref_view:
                     ref_kf_by_ts[ts] = kf
-                # spawn from all 9 views (was: ref only). add_new_gaussians
+                # spawn from all N views (was: ref only). add_new_gaussians
                 # handles align_depth + update_3dpts internally.
                 scene_model.add_new_gaussians()
                 n_keyframes += 1
@@ -521,8 +521,9 @@ if __name__ == "__main__":
     scene_model.enable_inference_mode()
 
     # === Post-hoc render evaluation (all keyframes) =========================
-    # Motivated by rig-mode having no test_hold: render each keyframe from its
-    # own pose, compare against the loaded GT, dump images + per-frame metrics.
+    # Rig eval uses a post-hoc split instead of non-rig test_hold: render each
+    # keyframe from its own pose, compare against the loaded GT, and dump
+    # per-frame metrics so train-view and holdout-view scores can be separated.
     # Backward is never called here → bypasses the iter≥10 CUDA rasterizer
     # crash and works with iter=2 baseline.
     if getattr(args, "use_rig", False):
@@ -590,9 +591,9 @@ if __name__ == "__main__":
                 f"LPIPS={summary['lpips_mean']:.3f}  "
                 f"(range PSNR {summary['psnr_min']:.2f}–{summary['psnr_max']:.2f})"
             )
-            # Honest eval: when --rig_holdout_view is set, split metrics
-            # into train (views included in optimization) vs holdout
-            # (excluded — provides a real generalization signal).
+            # Claim-grade rig NVS metric: when --rig_holdout_view is set, split
+            # train views (optimized) from the holdout view (not spawned/optimized).
+            # The all-frame mean is diagnostic only because it mixes both regimes.
             holdout_pf = [x for x in per_frame if x["is_test"]]
             train_pf = [x for x in per_frame if not x["is_test"]]
             if holdout_pf:

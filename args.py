@@ -82,7 +82,10 @@ def get_args():
     parser.add_argument('--num_pts_miniba_bootstrap', type=int, default=2000,
                         help="Number of keypoints considered for initial mini bundle adjustment")
     parser.add_argument('--iters_miniba_bootstrap', type=int, default=200)
-    parser.add_argument('--enable_reboot', action='store_true')
+    parser.add_argument('--enable_reboot', action='store_true',
+                        help="Non-rig diagnostic: reboot local initialization after "
+                             "tracking failure. Do not use as a hidden default for "
+                             "rig claims; rig reboot needs timestep-aware state reset.")
     # Focal estimation
     parser.add_argument('--fix_focal', action='store_true', 
                         help="If set, will use init_focal or init_fov without reoptimizing focal")
@@ -122,15 +125,18 @@ def get_args():
 
     ## Evaluation
     parser.add_argument('--test_hold', type=int, default=-1, 
-                        help="Holdout for test set, will exclude every test_hold image from the Gaussian optimization and use them for testing. The test frames will still be used for training the pose. If set to -1, no keyframes will be excluded from training.")
+                        help="Non-rig holdout stride: every test_hold-th image is "
+                             "excluded from Gaussian optimization but still used for "
+                             "pose training/evaluation. Rig mode uses "
+                             "--rig_holdout_view instead.")
     parser.add_argument('--test_frequency', type=int, default=-1, 
                         help="Test and get metrics every test_frequency keyframes")
     parser.add_argument('--display_runtimes', action='store_true', 
                         help="Display runtimes for each step in the tqdm bar")
 
-    ## Rig options (9-view Insta360 X5 rig)
+    ## Rig options (N-view zero-baseline virtual rig)
     parser.add_argument('--use_rig', action='store_true',
-                        help="Enable rig-aware data loading (9 views per timestep)")
+                        help="Enable rig-aware data loading (N views per timestep)")
     parser.add_argument('--rig_config', type=str, default="blender_rig.json",
                         help="Path to rig configuration JSON (Blender-style)")
     parser.add_argument('--ref_view', type=str, default="High_Cam07",
