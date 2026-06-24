@@ -18,8 +18,9 @@
 3. [RIG_ABLATION_PLAN_KO.md](RIG_ABLATION_PLAN_KO.md)
    - default / `--freeze_rig_poses`
    - `--depth_loss_weight_init 0`
-   - `--init_proba_scaler 0`
+   - MVS spawn ablation은 `--init_proba_scaler 0`을 그대로 쓰지 않는다는 보류 규칙
    - `--max_active_keyframes` consistency
+   - seed0 전체 OB3D default rerun 순서
 
 논문 claim을 쓸 때의 최소 안전 문장:
 

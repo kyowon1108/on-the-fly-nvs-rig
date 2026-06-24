@@ -41,7 +41,7 @@ COMMON="$COMMON --rig_holdout_view E+0_A090"
 | default | 없음 | 전체 rig OTF 경로 | 기준선 |
 | frozen pose | `--freeze_rig_poses` | photometric BA가 shared rig pose를 개선하는가 | ATE/holdout이 악화되면 pose-coupled photometric refinement가 causal |
 | no depth loss | `--depth_loss_weight_init 0` | DA-V2 ordinal depth regularization의 기여 | 변화가 작으면 depth prior가 핵심이 아님. 크게 악화되면 depth-primed baseline 필요 |
-| no MVS spawn | `--init_proba_scaler 0` | Laplacian sampled guided-MVS Gaussian spawn의 기여 | pose는 유지되고 recon만 악화되면 spawn은 품질 레버. pose까지 무너지면 geometry feedback 레버 |
+| no MVS spawn | 보류 | Laplacian sampled guided-MVS Gaussian spawn의 기여 | `--init_proba_scaler 0`은 clean ablation으로 확정 전까지 공식 matrix에서 제외 |
 | active window control | `--max_active_keyframes 60` 고정 | memory/offload policy 차이 제거 | N이 다른 rig sweep에서도 timestep-equivalent context를 맞춤 |
 
 ## 3. Copy-runnable commands
@@ -96,20 +96,38 @@ python train.py $COMMON --depth_loss_weight_init 0 \
   - vanilla COLMAP만 비교하면 불공정하고 MP-SfM/depth-primed COLMAP/NoPe-NeRF류 comparator가
     필요하다.
 
-### 3.4 `--init_proba_scaler 0`
+### 3.4 MVS spawn ablation: 보류
 
-```bash
-python train.py $COMMON --init_proba_scaler 0 \
-  -m results/abl_classroom_no_mvs_spawn_seed0
-```
+`--init_proba_scaler 0`은 현재 claim-grade ablation으로 쓰지 않는다.
 
-격리 대상:
+원래 의도:
 
 - `scene/scene_model.py::add_new_gaussians`의 Laplacian probability sampling을 0으로 만든다.
 - sampled UV가 없어 guided-MVS spawn branch는 skip된다.
 - triangulated match points spawn은 남는다.
 
-해석:
+하지만 실제 smoke에서는 이 설정이 단순히 MVS spawn만 끄는 clean control처럼 동작하지
+않았다. Gaussian 수와 memory가 빠르게 증가했고 run을 중단했다. 따라서 현재 판정은
+다음과 같다.
+
+- `--init_proba_scaler 0` 결과는 공식 ablation 표에 넣지 않는다.
+- seed0 전체 OB3D default rerun의 선행조건으로 삼지 않는다.
+- spawn/prune coupling을 논문 주장에 넣고 싶을 때만 별도 코드 매핑 후 새 flag를 만든다.
+
+새 flag는 이름 그대로 동작해야 한다.
+
+```text
+--disable_mvs_spawn
+```
+
+요구 조건:
+
+- guided-MVS sampled spawn만 끈다.
+- triangulated match point spawn은 유지한다.
+- coarse prune, visibility prune, opacity prune이 기존 default와 같은 순서로 돈다.
+- Gaussian count가 default보다 폭증하면 실패다.
+
+해석은 새 flag가 위 조건을 만족한 뒤에만 적용한다.
 
 - pose ATE는 비슷하고 holdout PSNR만 하락:
   - guided-MVS spawn은 reconstruction density/quality 레버다.
@@ -185,11 +203,16 @@ $$
 
 ## 6. 실행 순서
 
-1. `classroom_100` default/freeze/depth0/proba0를 seed 0으로 돌려 command와 parser를 검증한다.
-2. 같은 4 rows를 ego outdoor fail set에 돌린다.
-3. emerald non-ego crash diagnostic을 별도 crash protocol로 처리한다.
-4. 결과가 안정적이면 seed 1/2를 추가한다.
-5. native-EQR SfM/GLOMAP baseline과 같은 ATE evaluator로 pose 표를 만든다.
+1. parser guard를 검증한다. rig mode에서 `--enable_reboot`, `--test_hold`,
+   `--use_colmap_poses`가 즉시 실패해야 한다.
+2. `classroom_100` default/freeze/depth0를 seed 0으로 돌려 command와 evaluator를 검증한다.
+3. `results/`를 archive하거나 새 namespace를 만든 뒤, seed 0 default를 전체 OB3D ego
+   12 scenes에 돌린다.
+4. 같은 evaluator로 ATE meter/%span, train-view metric, holdout-view metric을 수집한다.
+5. ego outdoor fail set에 freeze/depth0를 추가해 mechanism claim이 outdoor에서도 유지되는지 본다.
+6. emerald non-ego crash diagnostic을 별도 crash protocol로 처리한다.
+7. 결과가 안정적이면 seed 1/2를 추가한다.
+8. native-EQR SfM/GLOMAP baseline과 같은 ATE evaluator로 pose 표를 만든다.
 
 ## 7. Kill criteria
 

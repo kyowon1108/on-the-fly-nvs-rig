@@ -146,6 +146,11 @@ bootstrap 이후 각 timestep은 다음 순서로 들어간다.
 
 ## 7. 그대로 포팅하면 안 되는 upstream CLI
 
+이 섹션의 옵션은 문서상 금지가 아니라 실행 금지다. `args.py`는 `--use_rig`와 아래
+옵션이 함께 들어오면 training/dataloader/GPU 초기화 전에 즉시 실패해야 한다. 조용히
+무시하는 것도 금지다. 조용한 무시는 실험 manifest와 실제 실행 조건이 달라지는 가장
+위험한 실패 모드다.
+
 ### `--enable_reboot`
 
 upstream non-rig reboot는 single-camera incremental tracking이 실패했을 때 일부 keyframe
@@ -167,7 +172,25 @@ upstream `--use_colmap_poses`는 image별 COLMAP pose를 직접 넣는 기능이
 허용되는 형태는 timestep별 rig-center trajectory를 import하고, 각 view pose는 항상
 `relative_Rt[view] @ rig_pose[t]`로 유도하는 방식뿐이다.
 
-## 8. 문서/코드 주석 규칙
+## 8. 결과 디렉터리 규칙
+
+claim-grade 재실행을 시작하기 전에는 `results/`를 직접 삭제하지 않는다. 기존 결과에는
+중단 run, smoke test, 유효 ablation이 섞여 있어도 provenance가 남아야 한다. 새 전체
+재실행은 아래 둘 중 하나로 시작한다.
+
+1. 기존 `results/`를 timestamp archive로 이동한다.
+
+   ```bash
+   mv results "results_archive_$(date +%Y%m%d_%H%M%S)"
+   mkdir -p results
+   ```
+
+2. 또는 `results/seed0_full_<date>/...`처럼 새 namespace를 만든다.
+
+논문 표에 들어가는 run은 반드시 command, seed, scene, holdout view, git commit을 함께
+기록한다. 중단된 run은 숫자를 재사용하지 않고 `aborted`로만 남긴다.
+
+## 9. 문서/코드 주석 규칙
 
 - view 수는 `9`, `12`로 쓰지 말고 `N` 또는 `len(rig.view_names)`로 쓴다.
 - `keyframe`이라고 할 때는 반드시 `(timestep, view)`인지, ref-view keyframe인지 구분한다.
@@ -175,7 +198,7 @@ upstream `--use_colmap_poses`는 image별 COLMAP pose를 직접 넣는 기능이
 - pose accuracy는 train-view render metric과 섞지 않는다.
 - `EQR->pinhole`은 novelty가 아니라 compatibility shim 또는 controlled stress probe로만 쓴다.
 
-## 9. 외부 기준
+## 10. 외부 기준
 
 - COLMAP rig/panorama docs: https://colmap.github.io/rigs.html
 - COLMAP key concepts: https://colmap.github.io/concepts.html

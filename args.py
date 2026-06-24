@@ -12,6 +12,32 @@
 import argparse
 import os
 
+
+def _validate_rig_args(args, parser):
+    """Reject upstream single-camera options that violate rig invariants."""
+    if not args.use_rig:
+        return
+
+    forbidden = []
+    if args.enable_reboot:
+        forbidden.append(
+            "--enable_reboot is single-camera state recovery; rig reboot must reset "
+            "complete timesteps and shared rig-pose slots."
+        )
+    if args.test_hold > 0:
+        forbidden.append(
+            "--test_hold is an image-stride holdout; rig mode uses "
+            "--rig_holdout_view to avoid train/test views sharing one pose."
+        )
+    if args.use_colmap_poses:
+        forbidden.append(
+            "--use_colmap_poses imports per-image poses; rig mode requires one "
+            "shared pose per timestep and view poses derived as relative_R @ rig_R."
+        )
+
+    if forbidden:
+        parser.error("rig mode does not support:\n  - " + "\n  - ".join(forbidden))
+
 def get_args():
     parser = argparse.ArgumentParser(description="Options for data loading and training")
 
@@ -175,6 +201,7 @@ def get_args():
                         help="Port of the viewer client, if using server viewer_mode")
 
     args = parser.parse_args()
+    _validate_rig_args(args, parser)
 
     ## Set the output directory if not specified
     if args.model_path == "":
