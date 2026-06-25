@@ -51,11 +51,7 @@ def infer_scene(run: Path, metadata: dict[str, Any]) -> str:
     source = metadata.get("config", {}).get("source_path")
     if source:
         return Path(str(source)).name
-    name = run.name
-    for token in ("classroom", "sun-temple", "emerald-square", "lone-monk"):
-        if token in name:
-            return token
-    return ""
+    return run.name
 
 
 def collect_one(run: Path) -> dict[str, Any]:
@@ -105,7 +101,11 @@ def main() -> None:
     parser.add_argument("--output", default="", help="CSV path. Defaults to stdout.")
     args = parser.parse_args()
 
-    rows = [collect_one(Path(run).expanduser().resolve()) for run in args.runs]
+    rows = []
+    for run in args.runs:
+        path = Path(run).expanduser().resolve()
+        if path.is_dir():
+            rows.append(collect_one(path))
     fieldnames = list(rows[0].keys()) if rows else []
 
     if args.output:
