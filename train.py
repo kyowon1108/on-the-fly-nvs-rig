@@ -182,8 +182,9 @@ if __name__ == "__main__":
                 increment_runtime(runtimes["BAB"], start_time)
 
                 # (rig) Hand the bootstrap rig poses to the photometric optimizer:
-                # it now OWNS one shared 9-DoF pose per ts; the N view poses are
-                # derived as rel @ rig (rel_t=0) and stay rigidly co-centered.
+                # it now owns one shared SE(3) rig pose per ts, represented by a
+                # 6D rotation parameter plus a 3D translation. The N view poses
+                # are derived as rel @ rig (rel_t=0) and stay co-centered.
                 rig_R6D_init = mtx2sixD(rig_Rts[:, :3, :3].contiguous())
                 rig_t_init = rig_Rts[:, :3, 3].contiguous()
                 scene_model.register_rig_poses(rig_R6D_init, rig_t_init, lr=args.lr_poses)

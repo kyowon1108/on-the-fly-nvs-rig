@@ -32,6 +32,12 @@ from simple_knn._C import distIndex2
 from poses.feature_detector import DescribedKeypoints
 from poses.matcher import Matcher
 from poses.guided_mvs import GuidedMVS
+from rig.triangulation_policy import (
+    classify_rig_triangulation_partner,
+    collect_allowed_rig_triangulation_ids,
+    make_rig_triangulation_audit,
+    record_used_rig_triangulation_ids,
+)
 from scene.optimizers import SparseGaussianAdam
 from scene.keyframe import Keyframe
 from scene.anchor import Anchor
@@ -79,11 +85,12 @@ class SceneModel:
         self.use_rig = getattr(args, "use_rig", False)
         self.freeze_rig_poses = getattr(args, "freeze_rig_poses", False)
         # Rig-pose ownership (rotation-only rig): the photometric optimizer owns
-        # ONE shared 9-DoF pose per timestep (rig_R6D 6 + rig_t 3). Each view pose
-        # is derived as rel @ rig (rel_t=0), so the N views of a ts stay rigidly
-        # co-centered through optimization. register_rig_poses (bootstrap) /
-        # append_rig_pose (incremental) populate these. When rig_optimizer is set,
-        # get_Rts() bypasses the Rt cache (poses change every iteration).
+        # one shared SE(3) rig pose per timestep, represented by a 6D rotation
+        # parameter plus a 3D translation. Each view pose is derived as rel @ rig
+        # (rel_t=0), so the N views of a ts stay rigidly co-centered through
+        # optimization. register_rig_poses (bootstrap) / append_rig_pose
+        # (incremental) populate these. When rig_optimizer is set, get_Rts()
+        # bypasses the Rt cache because poses change every iteration.
         self.rig_R6D = torch.nn.ParameterList()
         self.rig_t = torch.nn.ParameterList()
         self.rig_optimizer = None
@@ -178,6 +185,7 @@ class SceneModel:
         self.valid_keyframes = torch.empty(0, dtype=torch.bool)
         self.lock = threading.Lock()
         self.inference_mode = inference_mode
+        self.rig_leakage_audit = make_rig_triangulation_audit()
 
         ## Initialize helpers for Gaussian initialization
         radius = 3
@@ -295,6 +303,36 @@ class SceneModel:
             if not self.keyframes[i].info.get("is_test", False)
         ]
         return train_frames if train_frames else self.active_frames_gpu
+
+    def _classify_rig_partner(self, target_keyframe: Keyframe, partner_id: int) -> str:
+        return classify_rig_triangulation_partner(
+            self.keyframes, target_keyframe.info, partner_id
+        )
+
+    def rig_triangulation_allowed_ids(self, target_keyframe: Keyframe) -> list[int]:
+        """Return split-safe, cross-timestep triangulation partners for a rig keyframe.
+
+        `desc_kpts.matches` is a persistent cache and may contain same-timestep,
+        test/tracking, or temporary ids created by online PnP matching. This
+        method is the claim-grade filter used immediately before triangulation.
+        Candidate leakage is counted for diagnostics; only train/cross-ts/valid
+        ids are returned.
+        """
+        return collect_allowed_rig_triangulation_ids(
+            self.keyframes,
+            target_keyframe.info,
+            target_keyframe.desc_kpts.matches.keys(),
+            self.rig_leakage_audit,
+        )
+
+    def record_rig_triangulation_use(self, target_keyframe: Keyframe, partner_ids):
+        """Record and assert the actual partner ids used by rig triangulation."""
+        record_used_rig_triangulation_ids(
+            self.keyframes,
+            target_keyframe.info,
+            partner_ids,
+            self.rig_leakage_audit,
+        )
 
     def optimization_step(self, finetuning=False):
         if len(self.xyz) == 0:

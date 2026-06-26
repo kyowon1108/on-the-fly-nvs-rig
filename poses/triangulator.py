@@ -11,8 +11,8 @@
 
 import torch
 import torch.nn as nn
+from typing import Any
 
-from poses.feature_detector import DescribedKeypoints
 from utils import depth2points, pts2px
 
 def matches_to_points(uv, uv_matched, R, t, f, centre):
@@ -107,19 +107,57 @@ class Triangulator():
     def __call__(self, uv, uvs_others, Rt, Rts_others, f, centre):
         return self.model(uv, uvs_others, Rt, Rts_others, f, centre, self.max_error, self.min_dis)
     
-    def prepare_matches(self, desc_kpts: DescribedKeypoints):
+    def prepare_matches(self, desc_kpts: Any, allowed_kf_ids=None):
         """
         Organize the sets of matches for the triangulation.
         Select the top matches based on the number of matches available for each keyframe.
         """
         uv = desc_kpts.kpts
-        uvs_others = -torch.ones(self.n_cams, uv.shape[0], 2, device="cuda")
-        n_matches = torch.tensor([matches.idx.shape[0] for matches in desc_kpts.matches.values()])
-        kf_indices = torch.tensor(list(desc_kpts.matches.keys()))
+        uvs_others = -torch.ones(
+            self.n_cams, uv.shape[0], 2, device=uv.device, dtype=uv.dtype
+        )
+        if allowed_kf_ids is not None:
+            allowed_kf_ids = {
+                int(i)
+                for i in allowed_kf_ids
+                if _is_int_like(i)
+            }
+        else:
+            allowed_kf_ids = None
+
+        match_items = []
+        matches_by_index = {}
+        for raw_index, matches in desc_kpts.matches.items():
+            if not _is_int_like(raw_index):
+                continue
+            index = int(raw_index)
+            if allowed_kf_ids is None or index in allowed_kf_ids:
+                match_items.append((index, matches))
+                matches_by_index[index] = matches
+        if len(match_items) == 0:
+            return uv, uvs_others, []
+
+        n_matches = torch.tensor(
+            [matches.idx.shape[0] for _, matches in match_items],
+            device=uv.device,
+        )
+        kf_indices = torch.tensor(
+            [index for index, _ in match_items],
+            device=uv.device,
+        )
         chosen_ids = torch.topk(n_matches, min(self.n_cams, n_matches.shape[0])).indices
-        chosen_kfs_ids = kf_indices[chosen_ids].tolist()
+        chosen_kfs_ids = [int(i) for i in kf_indices[chosen_ids].tolist()]
 
         for i, index in enumerate(chosen_kfs_ids):
-            matches = desc_kpts.matches[index]
-            uvs_others[i, matches.idx, :] = matches.kpts_other
+            matches = matches_by_index[index]
+            idx = matches.idx.to(device=uvs_others.device)
+            uvs_others[i, idx, :] = matches.kpts_other.to(uvs_others)
         return uv, uvs_others, chosen_kfs_ids
+
+
+def _is_int_like(value) -> bool:
+    try:
+        int(value)
+        return True
+    except (TypeError, ValueError):
+        return False

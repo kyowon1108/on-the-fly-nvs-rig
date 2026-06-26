@@ -196,7 +196,7 @@ class Keyframe:
             return -self.get_R().T @ self.get_t()
 
     @torch.no_grad()
-    def update_3dpts(self, all_keyframes: list[Keyframe]):
+    def update_3dpts(self, all_keyframes: list[Keyframe], allowed_partner_ids=None):
         """
         Assign a 3D point to each keypoint in the keyframe based on triangulation and the latest rendered depth. 
         """
@@ -236,8 +236,14 @@ class Keyframe:
 
         ## Triangulation
         # Select keyframes to triangulate with based on their locations
+        if (
+            allowed_partner_ids is None
+            and self.is_rig_mode
+            and self.scene_model is not None
+        ):
+            allowed_partner_ids = self.scene_model.rig_triangulation_allowed_ids(self)
         uv, uvs_others, chosen_kfs_ids = self.triangulator.prepare_matches(
-            self.desc_kpts
+            self.desc_kpts, allowed_kf_ids=allowed_partner_ids
         )
         # No matches with any other keyframe -> nothing to triangulate. Bail out
         # before torch.stack([]) (which raises on an empty TensorList).
@@ -245,6 +251,8 @@ class Keyframe:
             if unload_desc_kpts:
                 self.desc_kpts.to("cpu")
             return
+        if self.is_rig_mode and self.scene_model is not None:
+            self.scene_model.record_rig_triangulation_use(self, chosen_kfs_ids)
         Rts_others = torch.stack(
             [all_keyframes[index].get_Rt() for i, index in enumerate(chosen_kfs_ids)],
             dim=0,
