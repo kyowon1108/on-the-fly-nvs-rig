@@ -60,6 +60,10 @@ from dataloaders.read_write_model import write_model
 def _make_rig_protocol_audit() -> dict[str, int]:
     audit = make_rig_triangulation_audit()
     audit.update({
+        "mvs_partner_count_same_ts": 0,
+        "spawn_count_train": 0,
+        "spawn_count_test": 0,
+        "spawn_count_tracking": 0,
         "spawn_skip_count_test": 0,
         "spawn_skip_count_tracking": 0,
     })

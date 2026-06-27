@@ -21,6 +21,9 @@ ZERO_AUDIT_KEYS = (
     "triangulation_partner_count_test",
     "triangulation_partner_count_tracking",
     "triangulation_partner_count_invalid_id",
+    "mvs_partner_count_same_ts",
+    "spawn_count_test",
+    "spawn_count_tracking",
 )
 
 
@@ -126,19 +129,9 @@ def _failures_for_claim(
         failures.append("missing rig completeness metadata")
 
     for key in ZERO_AUDIT_KEYS:
-        value = int(leakage.get(key, 0) or 0)
-        if value != 0:
-            failures.append(f"{key} must be 0, got {value}")
-
-    # Older artifacts may not persist this counter because the MVS path already
-    # asserts same-timestep exclusion at runtime. If present, it must be zero.
-    mvs_same_ts = int(leakage.get("mvs_partner_count_same_ts", 0) or 0)
-    if mvs_same_ts != 0:
-        failures.append(f"mvs_partner_count_same_ts must be 0, got {mvs_same_ts}")
-
-    # Non-train spawn commits must be zero. Skip counters are allowed: they prove
-    # the fail-closed gate ran before sparse/depth/spawn mutation.
-    for key in ("spawn_count_test", "spawn_count_tracking"):
+        if key not in leakage:
+            failures.append(f"missing required leakage audit key: {key}")
+            continue
         value = int(leakage.get(key, 0) or 0)
         if value != 0:
             failures.append(f"{key} must be 0, got {value}")
