@@ -57,6 +57,15 @@ from utils import (
 from dataloaders.read_write_model import write_model
 
 
+def _make_rig_protocol_audit() -> dict[str, int]:
+    audit = make_rig_triangulation_audit()
+    audit.update({
+        "spawn_skip_count_test": 0,
+        "spawn_skip_count_tracking": 0,
+    })
+    return audit
+
+
 class SceneModel:
     """
     Scene Model class that contains the scene's Gaussians, anchors, keyframes, and methods for rendering and optimization.
@@ -185,7 +194,7 @@ class SceneModel:
         self.valid_keyframes = torch.empty(0, dtype=torch.bool)
         self.lock = threading.Lock()
         self.inference_mode = inference_mode
-        self.rig_leakage_audit = make_rig_triangulation_audit()
+        self.rig_leakage_audit = _make_rig_protocol_audit()
 
         ## Initialize helpers for Gaussian initialization
         radius = 3
@@ -333,6 +342,16 @@ class SceneModel:
             partner_ids,
             self.rig_leakage_audit,
         )
+
+    def record_rig_spawn_skip(self, keyframe: Keyframe):
+        """Count non-train keyframes skipped before Gaussian state mutation."""
+        split = keyframe.info.get("rig_eval_split", "test")
+        key = (
+            "spawn_skip_count_tracking"
+            if split == "tracking"
+            else "spawn_skip_count_test"
+        )
+        self.rig_leakage_audit[key] = self.rig_leakage_audit.get(key, 0) + 1
 
     def optimization_step(self, finetuning=False):
         if len(self.xyz) == 0:
@@ -842,14 +861,15 @@ class SceneModel:
     def add_new_gaussians(self, keyframe_id: int = -1):
         """Use the given keyframe to add new Gaussians to the scene model."""
         keyframe = self.keyframes[keyframe_id]
+        if keyframe.info.get("is_test", False):
+            if self.use_rig:
+                self.record_rig_spawn_skip(keyframe)
+            return
+
         ## align the keyframe's depth
         if keyframe.desc_kpts.has_pt3d.sum() == 0:
             keyframe.update_3dpts(self.keyframes)
         keyframe.align_depth()
-
-        # Skip if the keyframe is a test keyframe
-        if keyframe.info["is_test"]:
-            return
 
         # Live camera centre of the TARGET keyframe (from its current pose, not the
         # cached approx_centre keyed to the initial pose). Used for MVS-neighbour
