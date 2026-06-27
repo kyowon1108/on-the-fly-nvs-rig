@@ -89,6 +89,24 @@ def _build_rig_completeness(expected, per_frame, failures, n_views):
     return completeness
 
 
+def _registered_rig_rows_from_keyframes(keyframes):
+    rows = []
+    for keyframe in keyframes:
+        info = keyframe.info
+        if "rig_view" not in info or ("source_ts" not in info and "rig_ts" not in info):
+            continue
+        ts = info["source_ts"] if "source_ts" in info else info["rig_ts"]
+        rows.append({
+            "rig_ts": int(ts),
+            "rig_view": info.get("rig_view"),
+            "rig_eval_split": info.get(
+                "rig_eval_split",
+                "test" if info.get("is_test", False) else "train",
+            ),
+        })
+    return rows
+
+
 if __name__ == "__main__":
     args = get_args()
     torch.random.manual_seed(args.seed)
@@ -726,9 +744,10 @@ if __name__ == "__main__":
             tracking_pf = [
                 x for x in per_frame if x.get("rig_eval_split") == "tracking"
             ]
+            registered_rows = _registered_rig_rows_from_keyframes(scene_model.keyframes)
             rig_completeness = _build_rig_completeness(
                 scene_model.rig_expected_timesteps,
-                per_frame,
+                registered_rows,
                 scene_model.rig_failed_timesteps,
                 len(dataset.rig.view_names),
             )

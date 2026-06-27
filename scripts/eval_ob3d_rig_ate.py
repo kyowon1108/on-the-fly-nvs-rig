@@ -36,6 +36,8 @@ def center_from_w2c(rt: Any) -> np.ndarray:
 
 
 def parse_ts_and_view(info: dict[str, Any]) -> tuple[int, str]:
+    if "source_ts" in info:
+        return int(info["source_ts"]), str(info.get("rig_view", ""))
     if "rig_ts" in info:
         return int(info["rig_ts"]), str(info.get("rig_view", ""))
     name = str(info.get("name", ""))

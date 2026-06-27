@@ -137,8 +137,12 @@ def _protocol_failures(
             failures.append(f"{key} must be 0, got {value}")
 
     missing_test = [int(ts) for ts in completeness.get("missing_timesteps_test", [])]
-    if fail_on_missing and missing_test:
-        failures.append(f"missing_test_timesteps must be empty, got {missing_test}")
+    missing_all = [int(ts) for ts in completeness.get("missing_timesteps_all", [])]
+    if fail_on_missing:
+        if missing_all:
+            failures.append(f"missing_timesteps_all must be empty, got {missing_all}")
+        if missing_test:
+            failures.append(f"missing_test_timesteps must be empty, got {missing_test}")
 
     for key in ("views_per_timestep_min", "views_per_timestep_max"):
         if key in completeness and int(completeness[key]) != expected_num_views:
