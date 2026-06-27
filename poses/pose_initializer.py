@@ -261,14 +261,23 @@ class PoseInitializer():
         uvs = []
         confs = []
         match_indices = []
-        for keyframe in keyframes:
-            matches = self.matcher(curr_desc_kpts, keyframe.desc_kpts, remove_outliers=True, update_kpts_flag="all", kID=index, kID_other=keyframe.index)
+        offloaded_sparse = []
+        try:
+            for keyframe in keyframes:
+                sparse_was_cpu = keyframe.desc_kpts.kpts.device.type == "cpu"
+                if sparse_was_cpu:
+                    keyframe.desc_kpts.to("cuda")
+                    offloaded_sparse.append(keyframe)
+                matches = self.matcher(curr_desc_kpts, keyframe.desc_kpts, remove_outliers=True, update_kpts_flag="all", kID=index, kID_other=keyframe.index)
 
-            mask = keyframe.desc_kpts.has_pt3d[matches.idx_other]
-            xyz.append(keyframe.desc_kpts.pts3d[matches.idx_other[mask]])
-            uvs.append(matches.kpts[mask])
-            confs.append(keyframe.desc_kpts.pts_conf[matches.idx_other[mask]])
-            match_indices.append(matches.idx[mask])
+                mask = keyframe.desc_kpts.has_pt3d[matches.idx_other]
+                xyz.append(keyframe.desc_kpts.pts3d[matches.idx_other[mask]])
+                uvs.append(matches.kpts[mask])
+                confs.append(keyframe.desc_kpts.pts_conf[matches.idx_other[mask]])
+                match_indices.append(matches.idx[mask])
+        finally:
+            for keyframe in offloaded_sparse:
+                keyframe.desc_kpts.to("cpu")
 
         xyz = torch.cat(xyz, dim=0)
         uvs = torch.cat(uvs, dim=0)
@@ -498,18 +507,27 @@ class PoseInitializer():
         for view_name, curr_desc_kpts in desc_kpts_per_view.items():
             xyz_list, uv_list, conf_list = [], [], []
             my_idx = view_indices[view_name]
-            for keyframe in keyframes_per_view[view_name]:
-                matches = self.matcher(
-                    curr_desc_kpts, keyframe.desc_kpts,
-                    remove_outliers=True, update_kpts_flag="all",
-                    kID=my_idx, kID_other=keyframe.index,
-                )
-                mask = keyframe.desc_kpts.has_pt3d[matches.idx_other]
-                if mask.sum() == 0:
-                    continue
-                xyz_list.append(keyframe.desc_kpts.pts3d[matches.idx_other[mask]])
-                uv_list.append(matches.kpts[mask])
-                conf_list.append(keyframe.desc_kpts.pts_conf[matches.idx_other[mask]])
+            offloaded_sparse = []
+            try:
+                for keyframe in keyframes_per_view[view_name]:
+                    sparse_was_cpu = keyframe.desc_kpts.kpts.device.type == "cpu"
+                    if sparse_was_cpu:
+                        keyframe.desc_kpts.to("cuda")
+                        offloaded_sparse.append(keyframe)
+                    matches = self.matcher(
+                        curr_desc_kpts, keyframe.desc_kpts,
+                        remove_outliers=True, update_kpts_flag="all",
+                        kID=my_idx, kID_other=keyframe.index,
+                    )
+                    mask = keyframe.desc_kpts.has_pt3d[matches.idx_other]
+                    if mask.sum() == 0:
+                        continue
+                    xyz_list.append(keyframe.desc_kpts.pts3d[matches.idx_other[mask]])
+                    uv_list.append(matches.kpts[mask])
+                    conf_list.append(keyframe.desc_kpts.pts_conf[matches.idx_other[mask]])
+            finally:
+                for keyframe in offloaded_sparse:
+                    keyframe.desc_kpts.to("cpu")
             if xyz_list:
                 xyz = torch.cat(xyz_list, dim=0)
                 uv = torch.cat(uv_list, dim=0)

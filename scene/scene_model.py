@@ -10,6 +10,7 @@
 #
 
 from argparse import Namespace
+from functools import wraps
 import gc
 import os
 import json
@@ -55,6 +56,15 @@ from utils import (
     sixD2mtx,
 )
 from dataloaders.read_write_model import write_model
+
+
+def _locked_scene_method(fn):
+    @wraps(fn)
+    def wrapped(self, *args, **kwargs):
+        with self.lock:
+            return fn(self, *args, **kwargs)
+
+    return wrapped
 
 
 def _make_rig_protocol_audit() -> dict[str, int]:
@@ -196,7 +206,10 @@ class SceneModel:
         self.sorted_frame_indices = None
         self.last_trained_id = 0
         self.valid_keyframes = torch.empty(0, dtype=torch.bool)
-        self.lock = threading.Lock()
+        # Serializes live viewer renders with Gaussian spawn/prune/optimization.
+        # The lock is re-entrant because training renders call SceneModel.render()
+        # from inside optimization/add_new_gaussians paths that also need the lock.
+        self.lock = threading.RLock()
         self.inference_mode = inference_mode
         self.extra_metadata = {}
         self.rig_expected_timesteps = {
@@ -394,25 +407,76 @@ class SceneModel:
         )
         self.rig_leakage_audit[key] = self.rig_leakage_audit.get(key, 0) + 1
 
+    def _latest_train_packet_frames(self):
+        """Return train keyframes from the latest active rig timestep.
+
+        Upstream OTF's `keyframe_id=-1` fast path means "train the latest
+        image". In rig mode the latest image is only one arbitrary view of the
+        latest timestamp packet, so using -1 gives that view extra gradient
+        budget. The rig unit is the whole timestamp packet; sample uniformly
+        from its train views instead.
+        """
+        if not self.use_rig:
+            return []
+        active_train = [
+            i for i in self.active_frames_gpu
+            if not self.keyframes[i].info.get("is_test", False)
+            and self.keyframes[i].ts_idx is not None
+        ]
+        if not active_train:
+            return []
+        latest_ts = max(int(self.keyframes[i].ts_idx) for i in active_train)
+        return [i for i in active_train if int(self.keyframes[i].ts_idx) == latest_ts]
+
+    def _live_centres_for_keyframe_ids(self, frame_ids):
+        """Return current camera centres for keyframe ids.
+
+        `approx_cam_centres` stores initial centres and does not move when
+        photometric BA changes rig poses. Anchor placement/render blending must
+        use live centres or long loop sequences can associate frames with the
+        wrong submap.
+        """
+        if len(frame_ids) == 0:
+            return torch.empty(0, 3, device="cuda")
+        if self.use_rig and len(self.rig_R6D) > 0:
+            centres_ts = self.get_live_rig_centres()
+            centres = []
+            for frame_id in frame_ids:
+                kf = self.keyframes[int(frame_id)]
+                if kf.ts_idx is not None:
+                    centres.append(centres_ts[int(kf.ts_idx)])
+                else:
+                    centres.append(kf.get_centre().detach())
+            return torch.stack(centres, dim=0)
+        return torch.stack(
+            [self.keyframes[int(frame_id)].get_centre().detach() for frame_id in frame_ids],
+            dim=0,
+        )
+
+    @_locked_scene_method
     def optimization_step(self, finetuning=False):
         if len(self.xyz) == 0:
             return
         # Select which keyframe to train on
         # We train on the latest keyframe with self.use_last_frame_proba probability or a random keyframe otherwise
         active_optim_frames = self._active_optimization_frames()
-        latest_is_train = (
-            not self.use_rig
-            or not self.keyframes[-1].info.get("is_test", False)
-        )
+        if len(active_optim_frames) == 0:
+            return
         if (
             np.random.rand() > self.use_last_frame_proba
             or self.last_trained_id == -1
             or finetuning
-            or not latest_is_train
         ):
             keyframe_id = np.random.choice(active_optim_frames)
         else:
-            keyframe_id = -1
+            if self.use_rig:
+                packet = self._latest_train_packet_frames()
+                keyframe_id = (
+                    int(np.random.choice(packet))
+                    if packet else int(np.random.choice(active_optim_frames))
+                )
+            else:
+                keyframe_id = -1
         keyframe = self.keyframes[keyframe_id]
         lvl = keyframe.pyr_lvl
 
@@ -559,8 +623,8 @@ class SceneModel:
         n_test_frames = 0
         start_index = 0 if all else self.active_anchor.keyframe_ids[0]
         for index, keyframe in enumerate(self.keyframes[start_index:]):
-            if keyframe.info["is_test"]:
-                gt_image = keyframe.image_pyr[0].cuda()
+            if self._is_metric_test_keyframe(keyframe):
+                gt_image = keyframe.get_eval_image().cuda()
                 render_pkg = self.render_from_id(keyframe.index, pyr_lvl=0)
                 image = render_pkg["render"]
                 mask = (
@@ -576,7 +640,10 @@ class SceneModel:
                     image[None], gt_image[None], train=False
                 ).item()
                 if with_LPIPS and self.lpips is not None:
-                    metrics["LPIPS"] += self.lpips(image[None], gt_image[None]).item()
+                    metrics["LPIPS"] += self.lpips(
+                        image[None] * 2 - 1,
+                        gt_image[None] * 2 - 1,
+                    ).item()
                 n_test_frames += 1
 
         if n_test_frames > 0:
@@ -605,7 +672,7 @@ class SceneModel:
         self.harmonize_test_exposure()
         os.makedirs(out_dir, exist_ok=True)
         for keyframe in self.keyframes:
-            if keyframe.info["is_test"]:
+            if self._is_metric_test_keyframe(keyframe):
                 render_pkg = self.render_from_id(keyframe.index, pyr_lvl=0)
                 image = torch.clamp(render_pkg["render"], 0, 1) * 255
                 image = image.permute(1, 2, 0).cpu().numpy().astype(np.uint8)
@@ -641,6 +708,7 @@ class SceneModel:
         render_pkg["render"] = render_pkg["render"].clamp(0, 1).view(3, height, width)
         return render_pkg
 
+    @_locked_scene_method
     def render(
         self,
         width: int,
@@ -765,7 +833,7 @@ class SceneModel:
         return -(rig_R.transpose(1, 2) @ rig_t[..., None]).squeeze(-1)
 
     @torch.no_grad()
-    def get_prev_keyframes(self, n: int, update_3dpts: bool, desc_kpts: DescribedKeypoints = None, exclude_ts: int = None, target_centre: torch.Tensor = None):
+    def get_prev_keyframes(self, n: int, update_3dpts: bool, desc_kpts: DescribedKeypoints = None, exclude_ts: int = None, target_centre: torch.Tensor = None, require_dense: bool = False):
         """
         Get the n previous keyframes that are the closest to the last
         If desc_kpts is not None, we find the previous keyframes that have the most matches with desc_kpts. The search window is given by self.num_prev_keyframes_check
@@ -801,8 +869,13 @@ class SceneModel:
             # candidate pool up-front (covers both the incremental PnP selection
             # and the guided-MVS neighbour selection).
             keep_train = torch.tensor(
-                [not self.keyframes[int(i)].info.get("is_test", False)
-                 for i in candidate_idx],
+                [
+                    (
+                        not self.keyframes[int(i)].info.get("is_test", False)
+                        and self.keyframes[int(i)].info.get("rig_eval_split") == "train"
+                    )
+                    for i in candidate_idx
+                ],
                 device=candidate_idx.device,
             )
             candidate_idx = candidate_idx[keep_train]
@@ -812,6 +885,12 @@ class SceneModel:
                 device=candidate_idx.device,
             )
             candidate_idx = candidate_idx[keep]
+        if require_dense:
+            keep_dense = torch.tensor(
+                [self.keyframes[int(i)].has_dense_cache for i in candidate_idx],
+                device=candidate_idx.device,
+            )
+            candidate_idx = candidate_idx[keep_dense]
 
         # (rig) Now that holdout/same-ts candidates are removed, sort the survivors
         # by distance to the TARGET keyframe's LIVE centre. For rig keyframes the
@@ -905,14 +984,35 @@ class SceneModel:
         valid_mask[render_pkg["visibility_filter"]] = False
         self.optimizer.add_and_prune(self.make_dummy_ext_tensor(), valid_mask)
 
-    @torch.no_grad()
     def add_new_gaussians(self, keyframe_id: int = -1):
-        """Use the given keyframe to add new Gaussians to the scene model."""
+        """Use one keyframe to add new Gaussians to the scene model."""
+        self.add_new_gaussians_for_keyframes([keyframe_id])
+
+    @torch.no_grad()
+    @_locked_scene_method
+    def add_new_gaussians_for_keyframes(self, keyframe_ids):
+        """Plan all requested keyframes first, then commit once.
+
+        For rig mode this is the timestamp-packet contract: all N views of a
+        timestep see the same pre-spawn Gaussian state, and the optimizer
+        mutation is committed once after planning. This is atomic scene-state
+        mutation, not a bitwise view-order-invariance guarantee for stochastic
+        per-view proposals.
+        """
+        plans = []
+        for keyframe_id in keyframe_ids:
+            plan = self._plan_new_gaussians(keyframe_id)
+            if plan is not None:
+                plans.append(plan)
+        self._commit_new_gaussian_plans(plans)
+
+    def _plan_new_gaussians(self, keyframe_id: int = -1):
+        """Build a spawn plan without mutating the Gaussian optimizer."""
         keyframe = self.keyframes[keyframe_id]
         if keyframe.info.get("is_test", False):
             if self.use_rig:
                 self.record_rig_spawn_skip(keyframe)
-            return
+            return None
 
         ## align the keyframe's depth
         if keyframe.desc_kpts.has_pt3d.sum() == 0:
@@ -976,6 +1076,7 @@ class SceneModel:
                 self.guided_mvs.n_cams + 1, update_3dpts=False,
                 exclude_ts=keyframe.info.get("rig_ts"),
                 target_centre=cam_centre,
+                require_dense=True,
             )
             for i, prev_keyframe in enumerate(prev_KFs):
                 if keyframe.index == prev_keyframe.index:
@@ -985,7 +1086,9 @@ class SceneModel:
             # keyframe's rig timestamp (zero baseline -> degenerate depth).
             _ex_ts = keyframe.info.get("rig_ts")
             if _ex_ts is not None:
-                assert all(p.info.get("rig_ts") != _ex_ts for p in prev_KFs), \
+                same_ts_mvs = sum(p.info.get("rig_ts") == _ex_ts for p in prev_KFs)
+                self.rig_leakage_audit["mvs_partner_count_same_ts"] += same_ts_mvs
+                assert same_ts_mvs == 0, \
                     "zero-baseline same-ts keyframe leaked into guided_mvs partners"
             # guided_mvs' CUDA kernel is compiled for a fixed NUM_CAMS = n_cams and
             # indexes exactly that many neighbours: passing FEWER reads out of bounds.
@@ -1006,7 +1109,10 @@ class SceneModel:
             sample_mask.zero_()
             sampled_uv = sampled_uv[:0]
 
-        # Remove Gaussians that are coarser than the newpoints
+        # Remove Gaussians that are coarser than the newpoints. In the packet
+        # path this is only a keep-mask plan: committing here would make later
+        # views in the same timestamp see a different scene than earlier views.
+        coarse_valid_gs_mask = None
         if len(self.xyz) > 0:
             main_gaussians_map = render_pkg["mainGaussID"]
             accurate_sample_mask = sample_mask.clone()
@@ -1016,14 +1122,8 @@ class SceneModel:
                 selected_main_gaussians[selected_main_gaussians >= 0],
                 return_counts=True,
             )
-            valid_gs_mask = torch.ones_like(self.xyz[:, 0], dtype=torch.bool)
-            valid_gs_mask[ids] = counts < 10
-            with self.lock:
-                self.optimizer.add_and_prune(
-                    self.make_dummy_ext_tensor(), valid_gs_mask
-                )
-            render_pkg = self.render_from_id(keyframe_id)
-            rendered_depth = 1 / render_pkg["invdepth"][0].clamp_min(1e-8)
+            coarse_valid_gs_mask = torch.ones_like(self.xyz[:, 0], dtype=torch.bool)
+            coarse_valid_gs_mask[ids] = counts < 10
 
         # Check for occlusions
         if rendered_depth is not None:
@@ -1040,7 +1140,7 @@ class SceneModel:
         # Add points from matching (these survive even when MVS was skipped)
         match_pts = keyframe.desc_kpts.pts3d[keyframe.desc_kpts.has_pt3d]
         if mvs_pts.shape[0] == 0 and match_pts.shape[0] == 0:
-            return
+            return None
         new_pts = torch.cat([mvs_pts, match_pts], dim=0)
 
         ## Initialize Colour
@@ -1106,6 +1206,8 @@ class SceneModel:
             )
             screen_size = self.f * self.scaling.max(dim=-1)[0] / dist
             valid_gs_mask *= screen_size < 0.5 * self.width
+            if coarse_valid_gs_mask is not None:
+                valid_gs_mask &= coarse_valid_gs_mask
         else:
             valid_gs_mask = torch.ones(0, device="cuda", dtype=torch.bool)
 
@@ -1118,8 +1220,44 @@ class SceneModel:
             "scaling": scales,
             "rotation": rots,
         }
-        with self.lock:
-            self.optimizer.add_and_prune(extension_tensors, valid_gs_mask)
+        if self.use_rig:
+            split = keyframe.info.get("rig_eval_split", "test")
+            key = (
+                f"spawn_count_{split}"
+                if split in ("train", "test", "tracking")
+                else "spawn_count_test"
+            )
+            self.rig_leakage_audit[key] = self.rig_leakage_audit.get(key, 0) + 1
+        return {
+            "extension_tensors": extension_tensors,
+            "valid_gs_mask": valid_gs_mask,
+        }
+
+    def _commit_new_gaussian_plans(self, plans):
+        """Apply one or more spawn plans with a single optimizer mutation."""
+        plans = [plan for plan in plans if plan is not None]
+        if not plans:
+            return
+        keys = list(plans[0]["extension_tensors"].keys())
+        extension_tensors = {
+            key: torch.cat([plan["extension_tensors"][key] for plan in plans], dim=0)
+            for key in keys
+        }
+        valid_gs_mask = plans[0]["valid_gs_mask"]
+        for plan in plans[1:]:
+            if plan["valid_gs_mask"].shape != valid_gs_mask.shape:
+                raise RuntimeError(
+                    "packet spawn plan saw a different Gaussian count before commit; "
+                    "the plan/commit invariant was violated"
+                )
+            valid_gs_mask = valid_gs_mask & plan["valid_gs_mask"]
+        old_count = self.xyz.shape[0]
+        if valid_gs_mask.shape[0] != old_count:
+            raise RuntimeError(
+                f"packet spawn keep mask has {valid_gs_mask.shape[0]} entries, "
+                f"but scene has {old_count} Gaussians"
+            )
+        self.optimizer.add_and_prune(extension_tensors, valid_gs_mask)
 
     def init_intrinsics(self):
         self.FoVx = focal2fov(self.f, self.width)
@@ -1132,17 +1270,52 @@ class SceneModel:
             .cuda()
         )
 
-    def move_rand_keyframe_to_cpu(self):
-        """Move a random keyframe to CPU memory"""
-        frame_id = np.random.choice(self.active_frames_gpu[:-self.n_kept_frames])
+    def _move_keyframe_to_cpu(self, frame_id: int):
         self.keyframes[frame_id].to("cpu")
+        if self.use_rig:
+            self.keyframes[frame_id].release_dense_cache()
         self.active_frames_cpu.append(frame_id)
-        self.active_frames_gpu.remove(frame_id) 
+        self.active_frames_gpu.remove(frame_id)
+
+    def move_rand_keyframe_to_cpu(self):
+        """Move old active keyframes to CPU memory.
+
+        Non-rig preserves upstream's single-frame eviction. Rig mode evicts an
+        entire old timestamp packet so the dense active set does not contain
+        partial 12-view packets, which would bias guided-MVS and optimization
+        toward whichever views happened to remain resident.
+        """
+        protected_tail = set(self.active_frames_gpu[-self.n_kept_frames:])
+        if self.use_rig:
+            eligible_by_ts = {}
+            for frame_id in self.active_frames_gpu:
+                if frame_id in protected_tail:
+                    continue
+                ts = self.keyframes[frame_id].info.get("rig_ts")
+                if ts is None:
+                    continue
+                eligible_by_ts.setdefault(ts, []).append(frame_id)
+            if not eligible_by_ts:
+                return
+            chosen_ts = np.random.choice(list(eligible_by_ts.keys()))
+            for frame_id in list(eligible_by_ts[chosen_ts]):
+                if frame_id in self.active_frames_gpu:
+                    self._move_keyframe_to_cpu(frame_id)
+            return
+
+        frame_id = np.random.choice(self.active_frames_gpu[:-self.n_kept_frames])
+        self._move_keyframe_to_cpu(frame_id)
 
     def move_rand_keyframe_to_gpu(self):
         """Move a random keyframe to GPU memory"""
         if len(self.active_frames_cpu) > 0:
-            frame_id = np.random.choice(self.active_frames_cpu)
+            candidates = [
+                frame_id for frame_id in self.active_frames_cpu
+                if self.keyframes[frame_id].has_dense_cache
+            ]
+            if len(candidates) == 0:
+                return
+            frame_id = np.random.choice(candidates)
             self.keyframes[frame_id].to("cuda")
             self.active_frames_gpu.insert(0, frame_id)
             self.active_frames_cpu.remove(frame_id) 
@@ -1238,6 +1411,8 @@ class SceneModel:
             max_active = self.max_active_keyframes * (self.n_rig_views if self.use_rig else 1)
             if len(self.active_frames_gpu) > max_active:
                 self.move_rand_keyframe_to_cpu()
+                if self.use_rig:
+                    return
                 # Reshuffle the active keyframes and clear cache
                 if len(self.active_frames_cpu) % 5 == 0:
                     self.move_rand_keyframe_to_cpu()
@@ -1252,10 +1427,13 @@ class SceneModel:
         self.update_anchor()
 
     def update_anchor(self, n_left_frames: int = 0):
-        """Update the anchor position and remove the last n_left_frames keyframes from the active anchor."""
-        anchor_position = self.approx_cam_centres[
-            self.first_active_frame : self.last_active_frame - n_left_frames
-        ].mean(dim=0)
+        """Update the active anchor from the live poses that optimized it."""
+        anchor_ids = list(self.active_anchor.keyframe_ids)
+        if n_left_frames > 0:
+            anchor_ids = anchor_ids[:-n_left_frames]
+        if len(anchor_ids) == 0:
+            return
+        anchor_position = self._live_centres_for_keyframe_ids(anchor_ids).mean(dim=0)
         self.active_anchor.position = anchor_position
         if n_left_frames > 0:
             self.active_anchor.keyframes = self.active_anchor.keyframes[:-n_left_frames]
@@ -1277,8 +1455,9 @@ class SceneModel:
             and self.first_active_frame < len(self.keyframes) - 2 * self.n_kept_frames
         ):
             with torch.no_grad():
+                latest_centre = self._live_centres_for_keyframe_ids([len(self.keyframes) - 1])[0]
                 dist = torch.linalg.vector_norm(
-                    self.xyz - self.approx_cam_centres[-1][None], dim=-1
+                    self.xyz - latest_centre[None], dim=-1
                 )
                 screen_size = self.f * self.scaling.mean(dim=-1) / dist
                 small_mask = screen_size < 1
@@ -1329,9 +1508,12 @@ class SceneModel:
                         self.optimizer.add_and_prune(merged_gaussians, ~small_mask)
 
                     # Create a new active anchor with the merged Gaussians
+                    new_anchor_centre = self._live_centres_for_keyframe_ids(
+                        [kf.index for kf in self.keyframes[-self.n_kept_frames :]]
+                    ).mean(dim=0)
                     self.active_anchor = Anchor(
                         self.gaussian_params,
-                        self.approx_cam_centres[-1],
+                        new_anchor_centre,
                         self.keyframes[-self.n_kept_frames :],
                     )
                     self.anchors.append(self.active_anchor)
@@ -1345,7 +1527,7 @@ class SceneModel:
                 gc.collect()
                 torch.cuda.empty_cache()
 
-    def save(self, path: str, reconstruction_time: float = 0, n_frames: int = 0):
+    def save(self, path: str, reconstruction_time: float = 0, n_frames: int = 0, n_timesteps: int = 0):
         # Get metrics
         metrics = {
             "num anchors": len(self.anchors),
@@ -1354,12 +1536,20 @@ class SceneModel:
         if reconstruction_time > 0:
             metrics["time"] = reconstruction_time
             if n_frames > 0:
-                metrics["FPS"] = n_frames / reconstruction_time
+                if self.use_rig and n_timesteps > 0:
+                    metrics["FPS"] = n_timesteps / reconstruction_time
+                    metrics["timesteps/sec"] = n_timesteps / reconstruction_time
+                    metrics["images/sec"] = n_frames / reconstruction_time
+                    metrics["FPS_unit"] = "rig_timesteps_per_second"
+                else:
+                    metrics["FPS"] = n_frames / reconstruction_time
+                    metrics["FPS_unit"] = "frames_per_second"
         metrics.update(self.evaluate(True, True, True))
 
         if path == "":
             print("No path provided, skipping save")
             return metrics
+        os.makedirs(path, exist_ok=True)
 
         # Save anchors
         pcd_path = os.path.join(path, "point_clouds")

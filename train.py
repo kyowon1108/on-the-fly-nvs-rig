@@ -291,8 +291,15 @@ if __name__ == "__main__":
                     len(scene_model.keyframes)
                     - len(bootstrap_rig_data) * len(view_order)
                 )
-                for scene_idx in range(first_bootstrap_scene_idx, len(scene_model.keyframes)):
-                    scene_model.add_new_gaussians(scene_idx)
+                n_views = len(view_order)
+                for packet_start in range(
+                    first_bootstrap_scene_idx,
+                    len(scene_model.keyframes),
+                    n_views,
+                ):
+                    scene_model.add_new_gaussians_for_keyframes(
+                        list(range(packet_start, packet_start + n_views))
+                    )
                 increment_runtime(runtimes["Init"], start_time)
 
                 start_time = time.time()
@@ -321,9 +328,13 @@ if __name__ == "__main__":
             # left views 1..N-1 doing PnP against STALE 3D points -> incremental drift,
             # worst exactly when the camera turns and pools diverge most.
             prev_per_view = {}
+            target_centre = scene_model._live_centres_for_keyframe_ids(
+                [len(scene_model.keyframes) - 1]
+            )[0]
             for v in view_order:
                 prev_per_view[v] = scene_model.get_prev_keyframes(
                     args.num_prev_keyframes_miniba_incr, False, desc_per_view[v],
+                    target_centre=target_centre,
                 )
             seen_prev = set()
             for prevs in prev_per_view.values():
@@ -357,6 +368,7 @@ if __name__ == "__main__":
 
             f_tensor = torch.tensor([focal], device="cuda", dtype=torch.float32)
             start_time = time.time()
+            new_scene_indices = []
             for v_name in view_order:
                 img, inf, desc = rig_batch[v_name]
                 rel = inf["rig_relative_Rt"].to("cuda")
@@ -369,12 +381,16 @@ if __name__ == "__main__":
                     dense_extractor, depth_estimator, triangulator, args,
                 )
                 scene_model.add_keyframe(kf)
+                new_scene_indices.append(len(scene_model.keyframes) - 1)
                 if v_name == dataset.ref_view:
                     ref_kf_by_ts[ts] = kf
-                # spawn from all N views (was: ref only). add_new_gaussians
-                # handles align_depth + update_3dpts internally.
-                scene_model.add_new_gaussians()
                 n_keyframes += 1
+            # Rig timestamp packet semantics: all N views are registered before
+            # spawn planning, and the Gaussian optimizer mutation is committed
+            # once after planning. This prevents later views from seeing an
+            # already-mutated scene state; stochastic proposal order is not
+            # claimed to be bitwise invariant.
+            scene_model.add_new_gaussians_for_keyframes(new_scene_indices)
             increment_runtime(runtimes["Add"], start_time)
             start_time = time.time()
             if is_stream:
@@ -616,7 +632,7 @@ if __name__ == "__main__":
             for kf in scene_model.keyframes:
                 pkg = scene_model.render_from_id(kf.index, pyr_lvl=0)
                 rendered = pkg["render"].clamp(0, 1)
-                gt = kf.image_pyr[0].to(rendered.device)
+                gt = kf.get_eval_image().to(rendered.device)
                 if gt.shape[-2:] != rendered.shape[-2:]:
                     continue
                 p = float(psnr_fn(rendered, gt))
@@ -809,7 +825,22 @@ if __name__ == "__main__":
 
     # Save the model and metrics
     print("Saving the reconstruction to:", args.model_path)
-    metrics = scene_model.save(args.model_path, reconstruction_time, len(dataset))
+    if getattr(args, "use_rig", False):
+        scene_model.extra_metadata["rig_incremental_refinement"] = {
+            "calls": int(getattr(pose_initializer, "_refine_call_count", 0)),
+            "fallbacks": int(getattr(pose_initializer, "_refine_fail_count", 0)),
+            "fallback_rate": (
+                float(getattr(pose_initializer, "_refine_fail_count", 0))
+                / max(int(getattr(pose_initializer, "_refine_call_count", 0)), 1)
+            ),
+            "fallback_policy": "MiniBARig incremental refinement failure falls back to rig PnP and is recorded here.",
+        }
+    metrics = scene_model.save(
+        args.model_path,
+        reconstruction_time,
+        len(dataset),
+        total_iters if getattr(args, "use_rig", False) else 0,
+    )
     print(
         ", ".join(
             f"{metric}: {value:.3f}"
@@ -846,6 +877,12 @@ if __name__ == "__main__":
                 torch.cuda.empty_cache()
                 
         # Set to inference mode so that the model can be rendered properly
+        scene_model.inference_mode = True
+
+    if args.viewer_mode != "none":
+        # After the reconstruction loop, keep the viewer in stable inference
+        # mode. During the loop, SceneModel.lock serializes live viewer renders
+        # with Gaussian spawn/prune/optimization.
         scene_model.inference_mode = True
 
     if args.viewer_mode != "none":

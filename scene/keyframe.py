@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 from argparse import Namespace
+import cv2
 import torch
 import torch.nn.functional as F
 
@@ -41,7 +42,7 @@ class Keyframe:
         args: Namespace,
         inference_mode: bool = False,
     ):
-        self.image_pyr = [image]
+        self.image_pyr = [image] if image is not None else []
         if not inference_mode: # Only extract depth and feature maps in training mode
             self.feat_map = feat_extractor(image)
             self.mono_idepth, self.mono_depth_conf = depth_estimator(image)
@@ -129,15 +130,25 @@ class Keyframe:
         self.approx_centre = -Rt[:3, :3].T @ Rt[:3, 3]
 
     def to(self, device: str, only_train=False):
-        if self.device.type == device:
+        target_type = torch.device(device).type
+        dense_on_target = (
+            not self.has_dense_cache
+            or self.image_pyr[0].device.type == target_type
+        )
+        sparse_on_target = (
+            self.desc_kpts is None
+            or self.desc_kpts.kpts.device.type == target_type
+        )
+        if dense_on_target and (only_train or sparse_on_target):
             return
-        for i in range(len(self.image_pyr)):
-            self.image_pyr[i] = self.image_pyr[i].to(device)
-            if self.idepth_pyr is not None:
-                self.idepth_pyr[i] = self.idepth_pyr[i].to(device)
-            if self.mask_pyr is not None:
-                self.mask_pyr[i] = self.mask_pyr[i].to(device)
-        if not only_train:
+        if self.has_dense_cache:
+            for i in range(len(self.image_pyr)):
+                self.image_pyr[i] = self.image_pyr[i].to(device)
+                if self.idepth_pyr is not None:
+                    self.idepth_pyr[i] = self.idepth_pyr[i].to(device)
+                if self.mask_pyr is not None:
+                    self.mask_pyr[i] = self.mask_pyr[i].to(device)
+        if not only_train and self.has_dense_cache:
             self.feat_map = self.feat_map.to(device)
             self.mono_idepth = self.mono_idepth.to(device)
             # mono_depth_conf is sampled in update_3dpts/sample_conf; if it is
@@ -146,10 +157,71 @@ class Keyframe:
             self.mono_depth_conf = self.mono_depth_conf.to(device)
             if self.latest_invdepth is not None:
                 self.latest_invdepth = self.latest_invdepth.to(device)
+        if not only_train and self.desc_kpts is not None and not sparse_on_target:
+            self.desc_kpts.to(device)
 
     @property
     def device(self):
-        return self.image_pyr[0].device
+        if self.has_dense_cache:
+            return self.image_pyr[0].device
+        if self.desc_kpts is not None:
+            return self.desc_kpts.kpts.device
+        return torch.device("cpu")
+
+    @property
+    def has_dense_cache(self):
+        return len(self.image_pyr) > 0 and self.image_pyr[0] is not None
+
+    @torch.no_grad()
+    def release_dense_cache(self):
+        """Drop cold dense tensors while preserving pose + sparse matches.
+
+        Long N-view rig sequences create thousands of keyframes. The sparse
+        keypoints/matches are still useful for PnP/triangulation, but the RGB
+        pyramid, dense feature map, mono depth/confidence and last rendered
+        depth dominate host RAM once frames are offloaded. Cold frames can reload
+        RGB from `info["image_path"]` for post-hoc metrics, so keeping these
+        dense caches is not necessary after they leave the active window.
+        """
+        if not self.has_dense_cache:
+            return
+        self.image_pyr = []
+        self.mask_pyr = None
+        self.feat_map = None
+        self.mono_idepth = None
+        self.mono_depth_conf = None
+        self.idepth_pyr = None
+        self.latest_invdepth = None
+
+    @torch.no_grad()
+    def get_eval_image(self):
+        """Return level-0 RGB for evaluation, reloading compacted frames."""
+        if self.has_dense_cache:
+            return self.image_pyr[0]
+        image_path = self.info.get("image_path")
+        if not image_path:
+            raise RuntimeError(
+                f"Keyframe {self.index} has no dense RGB cache and no image_path."
+            )
+        image = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
+        if image is None:
+            raise FileNotFoundError(f"Could not reload compacted keyframe image: {image_path}")
+        if image.ndim == 2:
+            image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+        else:
+            image = cv2.cvtColor(
+                image,
+                cv2.COLOR_BGRA2RGBA if image.shape[-1] == 4 else cv2.COLOR_BGR2RGB,
+            )
+            if image.shape[-1] == 4:
+                image = image[..., :3]
+        if image.shape[0] != self.height or image.shape[1] != self.width:
+            image = cv2.resize(
+                image,
+                (self.width, self.height),
+                interpolation=cv2.INTER_AREA,
+            )
+        return torch.from_numpy(image).permute(2, 0, 1).float().cuda() / 255.0
 
     def get_R(self):
         # Rig mode: derive view rotation from the shared rig pose (gradients
@@ -205,7 +277,11 @@ class Keyframe:
             self.desc_kpts.to("cuda")
 
         ## Update 3D points using the latest rendered depth
-        if self.latest_invdepth is not None:
+        if (
+            self.latest_invdepth is not None
+            and self.mono_idepth is not None
+            and self.mono_depth_conf is not None
+        ):
             uv = self.desc_kpts.kpts
             sampler = make_torch_sampler(uv.view(1, 1, -1, 2), self.width, self.height)
             model_idepth = F.grid_sample(
@@ -280,6 +356,10 @@ class Keyframe:
             self.desc_kpts.to("cpu")
 
     def get_mono_idepth(self, lvl=0):
+        if self.idepth_pyr is None:
+            raise RuntimeError(
+                f"Keyframe {self.index} has no mono-depth cache; it was compacted."
+            )
         if self.idepth_pyr[lvl].device.type != "cuda":
             self.idepth_pyr[lvl] = self.idepth_pyr[lvl].cuda()
         return self.idepth_pyr[lvl] * self.depth_scale + self.depth_offset
@@ -290,6 +370,8 @@ class Keyframe:
         Align the mono depth to the triangulated depth of the keypoints.
         update_3dpts must have been called before this function.
         """
+        if self.mono_idepth is None:
+            return
         if (self.desc_kpts.pts_conf > 0).any():
             self.mono_idepth = align_depth(
                 self.mono_idepth, self.desc_kpts, self.width, self.height
@@ -397,6 +479,7 @@ class Keyframe:
         keyframe.centre = torch.tensor(
             [width / 2, height / 2], device="cuda"  # cx=cy=W/2 to match eqr_to_pinhole
         )
+        keyframe.f = torch.tensor([config["f"]], device="cuda", dtype=torch.float32)
         return keyframe
 
     def to_colmap(self, id):

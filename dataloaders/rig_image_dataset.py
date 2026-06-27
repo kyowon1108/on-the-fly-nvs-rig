@@ -281,6 +281,10 @@ class RigImageDataset:
                 "stream_idx": item["stream_idx"],
                 "rig_eval_split": eval_split,
                 "rig_filename": item["filename"],
+                # Kept for long-sequence memory compaction: cold keyframes may
+                # drop their dense RGB cache and reload the source image only
+                # for post-hoc evaluation / visualization.
+                "image_path": item["path"],
                 "rig_relative_Rt": self.rig.relative_Rt[item["view"]].clone(),
             }
 
