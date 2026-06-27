@@ -36,6 +36,11 @@ def _validate_rig_args(args, parser):
             "--use_colmap_poses imports per-image poses; rig mode requires one "
             "shared pose per timestep and view poses derived as relative_R @ rig_R."
         )
+    if args.save_at_finetune_epoch:
+        forbidden.append(
+            "--save_at_finetune_epoch runs upstream fine-tuning after online "
+            "reconstruction; rig fine-tuning is not yet split/offload safe."
+        )
     if args.rig_train_timesteps_file and not args.rig_test_timesteps_file:
         forbidden.append(
             "--rig_train_timesteps_file requires --rig_test_timesteps_file so "
