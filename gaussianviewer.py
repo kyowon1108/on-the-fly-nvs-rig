@@ -10,6 +10,7 @@
 #
 
 import json
+import os
 import numpy as np
 from argparse import ArgumentParser, Namespace
 from imgui_bundle import imgui_ctx, imgui
@@ -18,13 +19,50 @@ import time
 
 from graphdecoviewer import Viewer
 from graphdecoviewer.types import ViewerMode
-from graphdecoviewer.widgets.image import TorchImage
+from graphdecoviewer.widgets.image import NumpyImage, TorchImage
 from graphdecoviewer.widgets.radio import RadioPicker
 from graphdecoviewer.widgets.cameras.fps import FPSCamera
 from graphdecoviewer.widgets.ellipsoid_viewer import EllipsoidViewer
 
 class Dummy(object):
     pass
+
+
+class CpuImage(NumpyImage):
+    """OpenGL texture upload path that avoids CUDA-GL interop.
+
+    WSLg/Mesa often exposes enough OpenGL for an ImGui window but does not
+    support registering GL textures with CUDA.  `TorchImage` then crashes in
+    cuGraphicsGLRegisterImage.  This widget copies the rendered tensor back to
+    host memory before the regular OpenGL texture upload.  It is slower, but it
+    keeps the viewer usable and isolates the training CUDA context from viewer
+    interop failures.
+    """
+
+    def step(self, img):
+        if not isinstance(img, np.ndarray):
+            img = img.detach().cpu().numpy()
+        self.img = np.ascontiguousarray(img)
+        self.step_called = True
+
+
+class DisabledEllipsoidViewer:
+    """No-op replacement for the GLSL 4.30 ellipsoid widget on weak GL stacks."""
+
+    enabled = False
+    num_gaussians = None
+    scaling_modifier = 1
+    render_floaters = False
+    limit = 0.2
+
+    def step(self, camera):
+        return None
+
+    def upload(self, *args, **kwargs):
+        return None
+
+    def show_gui(self):
+        return None
 
 class SnapMode(IntEnum):
     free = auto()
@@ -86,10 +124,25 @@ class GaussianViewer(Viewer):
                                [0, 0, 0, 1]])
         )
         self.cameras = {"top_view": self.top_view_camera, "point_view": self.point_view_camera}
-        self.point_view = TorchImage(self.mode)
-        self.top_view = TorchImage(self.mode)
+        # Local WSL viewers commonly fail on CUDA-OpenGL interop even when the
+        # window itself opens.  Keep the fast CUDA texture path for remote
+        # server/client use, but default local mode to a CPU texture upload.
+        use_cuda_gl = (
+            self.mode is not ViewerMode.LOCAL
+            or os.environ.get("OTF_VIEWER_CUDA_GL") == "1"
+        )
+        image_widget = TorchImage if use_cuda_gl else CpuImage
+        if self.mode is ViewerMode.LOCAL and image_widget is CpuImage:
+            print(
+                "[viewer] local mode uses CPU image upload. "
+                "Set OTF_VIEWER_CUDA_GL=1 to retry CUDA-OpenGL interop."
+            )
+        self.point_view = image_widget(self.mode)
+        self.top_view = image_widget(self.mode)
         self.views = {"top_view": self.top_view, "point_view": self.point_view}
-        self.ellipsoid_viewer = EllipsoidViewer(self.mode)
+        self.ellipsoid_viewer = (
+            EllipsoidViewer(self.mode) if use_cuda_gl else DisabledEllipsoidViewer()
+        )
 
         # Render modes
         self.render_modes = ["Splats", "Depth", "Ellipsoids"]
@@ -149,6 +202,10 @@ class GaussianViewer(Viewer):
             self.ellipsoid_viewer.enabled = data["ellipsoid_enabled"]
     
     def step(self):
+        # Live training is allowed: SceneModel serializes viewer renders with
+        # optimization/spawn through a re-entrant lock.  The viewer still uses
+        # no_grad so inspection does not build autograd graphs.
+
         # Get camera matrix
         self.updated_pose = None
         if self.snap_mode.value in [SnapMode.keyframe, SnapMode.last]:
@@ -189,7 +246,17 @@ class GaussianViewer(Viewer):
                 width = camera.res_x
                 height = camera.res_y
                 viewmatrix = torch.tensor(camera.to_camera, dtype=torch.float32).cuda().transpose(0, 1)
-                render_pkg = self.scene_model.render(width, height, viewmatrix, self.scaling_factor[view], torch.tensor(self.bg_color, device="cuda"), view=="top_view", camera.fov_x, camera.fov_y)
+                with torch.no_grad():
+                    render_pkg = self.scene_model.render(
+                        width,
+                        height,
+                        viewmatrix,
+                        self.scaling_factor[view],
+                        torch.tensor(self.bg_color, device="cuda"),
+                        view == "top_view",
+                        camera.fov_x,
+                        camera.fov_y,
+                    )
                 if self.render_mode() == "Splats":
                     image = render_pkg["render"].clamp(0, 1.0).mul(255).permute(1, 2, 0).byte()
                 elif self.render_mode() == "Depth":
@@ -222,7 +289,10 @@ class GaussianViewer(Viewer):
                 self.ellipsoid_viewer.step(camera)
 
         # Upload to OpenGL only after first anchor has been loaded (will be done in first render call)
-        if self.ellipsoid_viewer.num_gaussians != self.scene_model.n_active_gaussians:
+        if (
+            self.ellipsoid_viewer.enabled
+            and self.ellipsoid_viewer.num_gaussians != self.scene_model.n_active_gaussians
+        ):
             self.ellipsoid_viewer.upload(
                 self.scene_model.xyz.detach().cpu().numpy(),
                 self.scene_model.rotation.detach().cpu().numpy(),
