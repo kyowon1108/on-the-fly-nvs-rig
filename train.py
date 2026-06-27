@@ -147,13 +147,18 @@ if __name__ == "__main__":
                     "Rig dataset desync: expected a ref-view frame at batch "
                     f"start, got view={info['rig_view']} ts={info['rig_ts']}"
                 )
-            ts = info["rig_ts"]
+            ts = int(info.get("source_ts", info["rig_ts"]))
+            stream_idx = int(info.get("stream_idx", ts))
             rig_batch = {dataset.ref_view: (image, info, detector(image))}
             for _ in range(len(dataset.non_ref_views)):
                 nr_img, nr_info = dataset.getnext()
-                if nr_info["rig_ts"] != ts:
+                nr_ts = int(nr_info.get("source_ts", nr_info["rig_ts"]))
+                nr_stream_idx = int(nr_info.get("stream_idx", nr_ts))
+                if nr_ts != ts or nr_stream_idx != stream_idx:
                     raise RuntimeError(
-                        f"rig batch desync: expected ts={ts}, got ts={nr_info['rig_ts']}"
+                        "rig batch desync: expected "
+                        f"source_ts={ts}, stream_idx={stream_idx}; got "
+                        f"source_ts={nr_ts}, stream_idx={nr_stream_idx}"
                     )
                 rig_batch[nr_info["rig_view"]] = (nr_img, nr_info, detector(nr_img))
             increment_runtime(runtimes["Load"], start_time)
@@ -162,7 +167,12 @@ if __name__ == "__main__":
             view_order = list(dataset.rig.view_names)
 
             if n_rig_bootstrap_ts < B:
-                bootstrap_rig_data.append({"ts": ts, "frames": rig_batch})
+                bootstrap_rig_data.append({
+                    "ts": ts,
+                    "source_ts": ts,
+                    "stream_idx": stream_idx,
+                    "frames": rig_batch,
+                })
                 n_rig_bootstrap_ts += 1
                 if n_rig_bootstrap_ts < B:
                     continue
@@ -201,6 +211,7 @@ if __name__ == "__main__":
                         # (rig) tag info so Keyframe takes the rig branch: its pose is
                         # derived from scene_model.rig_R6D[ts_idx], not a free param.
                         inf["ts_idx"] = ts_i
+                        inf["rig_slot_idx"] = ts_i
                         inf["rig_view"] = v_name
                         kf = Keyframe(
                             img, inf, desc, Rt_view, n_keyframes, f_tensor,
@@ -291,6 +302,7 @@ if __name__ == "__main__":
                 rel = inf["rig_relative_Rt"].to("cuda")
                 Rt_view = rel @ rig_pose
                 inf["ts_idx"] = new_ts_idx
+                inf["rig_slot_idx"] = new_ts_idx
                 inf["rig_view"] = v_name
                 kf = Keyframe(
                     img, inf, desc, Rt_view, n_keyframes, f_tensor,

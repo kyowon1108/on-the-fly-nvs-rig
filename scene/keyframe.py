@@ -84,7 +84,7 @@ class Keyframe:
         # (register_rig_poses / append_rig_pose). Per-view independent pose
         # optimization would let the N views drift apart and break the rig.
         self.rig_view = info.get("rig_view", None)
-        self.ts_idx = info.get("ts_idx", None)
+        self.ts_idx = info.get("ts_idx", info.get("rig_slot_idx", None))
         self.is_rig_mode = (self.rig_view is not None and self.ts_idx is not None)
         self.scene_model = None  # back-ref set by scene_model.add_keyframe (rig only)
 
@@ -338,8 +338,28 @@ class Keyframe:
         info = {
             "is_test": self.info["is_test"],
         }
-        if "name" in self.info:
-            info["name"] = self.info["name"]
+        passthrough = [
+            "name",
+            "rig_view",
+            "rig_ts",
+            "source_ts",
+            "stream_idx",
+            "rig_eval_split",
+            "rig_filename",
+            "image_path",
+            "ts_idx",
+            "rig_slot_idx",
+        ]
+        for key in passthrough:
+            if key in self.info:
+                info[key] = self.info[key]
+        if "rig_relative_Rt" in self.info:
+            rel = self.info["rig_relative_Rt"]
+            info["rig_relative_Rt"] = (
+                rel.detach().cpu().numpy().tolist()
+                if isinstance(rel, torch.Tensor)
+                else rel
+            )
         if "Rt" in self.info:
             info["gt_Rt"] = self.info["Rt"].cpu().numpy().tolist()
 
@@ -353,6 +373,12 @@ class Keyframe:
     def from_json(cls, config, index, height, width):
         if "gt_Rt" in config["info"]:
             config["info"]["Rt"] = torch.tensor(config["info"]["gt_Rt"]).cuda()
+        if "rig_relative_Rt" in config["info"] and not isinstance(
+            config["info"]["rig_relative_Rt"], torch.Tensor
+        ):
+            config["info"]["rig_relative_Rt"] = torch.tensor(
+                config["info"]["rig_relative_Rt"], device="cuda", dtype=torch.float32
+            )
         keyframe = cls(
             image=None,
             info=config["info"],

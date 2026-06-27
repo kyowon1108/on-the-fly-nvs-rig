@@ -68,6 +68,42 @@ def _load_timestep_split(path: str, valid_timesteps: set[int]) -> set[int]:
     return test_timesteps
 
 
+def _build_timestep_records(names, start_at: int = 0) -> list[dict]:
+    """Return source timestep semantics for a sorted online stream.
+
+    `source_ts` is the original EQR frame id parsed from the filename and is
+    used for splits, ATE, and reporting. `stream_idx` is only the rank in the
+    online stream after `start_at` trimming; it is never a pose-optimizer slot.
+    """
+    timestep_names = sorted(names)
+    if not timestep_names:
+        raise RuntimeError("No timesteps are shared by all rig views.")
+    if start_at < 0:
+        raise ValueError(f"--start_at must be non-negative, got {start_at}")
+    if start_at >= len(timestep_names):
+        raise ValueError(
+            f"--start_at ({start_at}) >= num_timesteps "
+            f"({len(timestep_names)}); nothing to iterate."
+        )
+
+    records = []
+    seen_source_ts = {}
+    for stream_idx, fname in enumerate(timestep_names[start_at:]):
+        source_ts = _parse_timestep_token(fname)
+        if source_ts in seen_source_ts:
+            raise ValueError(
+                "Prepared rig scene has duplicate source timestep "
+                f"{source_ts}: {seen_source_ts[source_ts]!r} and {fname!r}"
+            )
+        seen_source_ts[source_ts] = fname
+        records.append({
+            "filename": fname,
+            "source_ts": source_ts,
+            "stream_idx": stream_idx,
+        })
+    return records
+
+
 class RigImageDataset:
     """Two-pass iterator over an N-view rig directory."""
 
@@ -131,41 +167,36 @@ class RigImageDataset:
         common = set(self.frames_per_view[self.ref_view])
         for view in self.rig.view_names:
             common &= set(self.frames_per_view[view])
-        self.timestep_names = sorted(common)  # e.g. ["frame_00001.png", ...]
-        if not self.timestep_names:
-            raise RuntimeError("No timesteps are shared by all rig views.")
-        self.ts_index = {name: i for i, name in enumerate(self.timestep_names)}
+        self.timestep_records = _build_timestep_records(common, int(args.start_at))
+        self.timestep_names = [record["filename"] for record in self.timestep_records]
+        self.source_ts_by_name = {
+            record["filename"]: record["source_ts"]
+            for record in self.timestep_records
+        }
+        self.stream_index = {
+            record["filename"]: record["stream_idx"]
+            for record in self.timestep_records
+        }
+        # Backward-compatible name for code that only needs online ordering.
+        self.ts_index = self.stream_index
         self.num_timesteps = len(self.timestep_names)
 
         # Iteration order: every timestep emits a full N-view batch, ref first,
         # non-ref in fixed rig order. train.py consumes the whole batch together.
         self.items: List[dict] = []
-        for fname in self.timestep_names:
-            ts = self.ts_index[fname]
-            self.items.append({"view": self.ref_view, "ts": ts,
+        for record in self.timestep_records:
+            fname = record["filename"]
+            source_ts = record["source_ts"]
+            stream_idx = record["stream_idx"]
+            self.items.append({"view": self.ref_view, "ts": source_ts,
+                               "source_ts": source_ts, "stream_idx": stream_idx,
                                "path": os.path.join(self.images_root, self.ref_view, fname),
                                "filename": fname})
             for view in self.non_ref_views:
-                self.items.append({"view": view, "ts": ts,
+                self.items.append({"view": view, "ts": source_ts,
+                                   "source_ts": source_ts, "stream_idx": stream_idx,
                                    "path": os.path.join(self.images_root, view, fname),
                                    "filename": fname})
-
-        # start_at is in *timestep* units for rig mode (vs per-image in the
-        # single-camera dataset). Drop the first N full rig batches and
-        # shrink timestep_names accordingly so train.py's
-        # `dataset.num_timesteps` reflects the remaining iterations.
-        if args.start_at > 0:
-            n_views_per_batch = len(self.rig.view_names)
-            skip_ts = int(args.start_at)
-            if skip_ts >= self.num_timesteps:
-                raise ValueError(
-                    f"--start_at ({skip_ts}) >= num_timesteps "
-                    f"({self.num_timesteps}); nothing to iterate."
-                )
-            skip_items = skip_ts * n_views_per_batch
-            self.items = self.items[skip_items:]
-            self.timestep_names = self.timestep_names[skip_ts:]
-            self.num_timesteps = len(self.timestep_names)
 
         # Per-item metadata consumed by the training loop.
         # is_test marks held-out frames so add_new_gaussians and the scene loss
@@ -191,7 +222,7 @@ class RigImageDataset:
         train_split_file = (getattr(args, "rig_train_timesteps_file", "") or "").strip()
         self.test_timesteps: set[int] = set()
         self.train_timesteps: set[int] = set()
-        valid_timesteps = {item["ts"] for item in self.items}
+        valid_timesteps = {item["source_ts"] for item in self.items}
         if test_split_file:
             if holdout_view:
                 raise ValueError(
@@ -225,11 +256,14 @@ class RigImageDataset:
         )
         self.infos: Dict[str, dict] = {}
         for item in self.items:
-            key = _frame_key(item["view"], item["ts"])
-            if item["ts"] in self.test_timesteps:
+            key = _frame_key(item["view"], item["source_ts"])
+            if item["source_ts"] in self.test_timesteps:
                 eval_split = "test"
             elif self.train_timesteps:
-                eval_split = "train" if item["ts"] in self.train_timesteps else "tracking"
+                eval_split = (
+                    "train" if item["source_ts"] in self.train_timesteps
+                    else "tracking"
+                )
             elif holdout_view and item["view"] == holdout_view:
                 eval_split = "test"
             else:
@@ -242,7 +276,9 @@ class RigImageDataset:
                 "is_test": (eval_split != "train"),
                 "name": key,
                 "rig_view": item["view"],
-                "rig_ts": item["ts"],
+                "rig_ts": item["source_ts"],
+                "source_ts": item["source_ts"],
+                "stream_idx": item["stream_idx"],
                 "rig_eval_split": eval_split,
                 "rig_filename": item["filename"],
                 "rig_relative_Rt": self.rig.relative_Rt[item["view"]].clone(),
@@ -283,7 +319,7 @@ class RigImageDataset:
     def __getitem__(self, index: int):
         item = self.items[index]
         image = self._load_image(item["path"], cv2.IMREAD_UNCHANGED)
-        key = _frame_key(item["view"], item["ts"])
+        key = _frame_key(item["view"], item["source_ts"])
         # Return a shallow copy so per-frame mutations (mask, ts_idx set later by
         # train.py) don't accumulate on the shared self.infos[key] dict.
         info = dict(self.infos[key])
