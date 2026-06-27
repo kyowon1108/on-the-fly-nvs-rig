@@ -28,7 +28,7 @@ class FakeKeyframe:
         self.info = {
             "is_test": split != "train",
             "rig_eval_split": split,
-            "rig_ts": 3,
+            "source_ts": 3,
             "rig_view": "E+0_A000",
         }
         self.desc_kpts = FakeDesc()

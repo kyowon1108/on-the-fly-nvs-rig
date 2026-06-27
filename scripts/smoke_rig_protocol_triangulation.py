@@ -35,10 +35,10 @@ class FakeDesc:
 
 def _scene_keyframes():
     return [
-        SimpleNamespace(info={"rig_ts": 9, "rig_eval_split": "train", "is_test": False}),
-        SimpleNamespace(info={"rig_ts": 10, "rig_eval_split": "train", "is_test": False}),
-        SimpleNamespace(info={"rig_ts": 8, "rig_eval_split": "test", "is_test": True}),
-        SimpleNamespace(info={"rig_ts": 7, "rig_eval_split": "tracking", "is_test": True}),
+        SimpleNamespace(info={"source_ts": 9, "rig_eval_split": "train", "is_test": False}),
+        SimpleNamespace(info={"source_ts": 10, "rig_eval_split": "train", "is_test": False}),
+        SimpleNamespace(info={"source_ts": 8, "rig_eval_split": "test", "is_test": True}),
+        SimpleNamespace(info={"source_ts": 7, "rig_eval_split": "tracking", "is_test": True}),
     ]
 
 
@@ -68,7 +68,7 @@ def test_prepare_matches_allowed_filter() -> None:
 
 def test_rig_partner_policy_and_actual_use_assert() -> None:
     keyframes = _scene_keyframes()
-    target_info = {"rig_ts": 10, "rig_eval_split": "train", "is_test": False}
+    target_info = {"source_ts": 10, "rig_eval_split": "train", "is_test": False}
     desc = FakeDesc()
     for partner_id in (0, 1, 2, 3, "tmp_pnp"):
         desc.matches[partner_id] = FakeMatches(8 if partner_id in (3, "tmp_pnp") else 2)
@@ -100,7 +100,7 @@ def test_rig_partner_policy_and_actual_use_assert() -> None:
 
 def test_no_valid_train_cross_ts_partner_is_empty_and_non_mutating() -> None:
     keyframes = _scene_keyframes()
-    target_info = {"rig_ts": 10, "rig_eval_split": "train", "is_test": False}
+    target_info = {"source_ts": 10, "rig_eval_split": "train", "is_test": False}
     desc = FakeDesc()
     for partner_id in (1, 2, 3, "tmp_pnp"):
         desc.matches[partner_id] = FakeMatches(8)

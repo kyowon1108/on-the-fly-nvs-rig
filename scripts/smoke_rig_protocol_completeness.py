@@ -21,10 +21,10 @@ def main() -> None:
         "tracking": [18],
     }
     per_frame = [
-        {"rig_ts": 2, "rig_view": "A", "rig_eval_split": "train"},
-        {"rig_ts": 2, "rig_view": "B", "rig_eval_split": "train"},
-        {"rig_ts": 18, "rig_view": "A", "rig_eval_split": "tracking"},
-        {"rig_ts": 18, "rig_view": "B", "rig_eval_split": "tracking"},
+        {"source_ts": 2, "rig_view": "A", "rig_eval_split": "train"},
+        {"source_ts": 2, "rig_view": "B", "rig_eval_split": "train"},
+        {"source_ts": 18, "rig_view": "A", "rig_eval_split": "tracking"},
+        {"source_ts": 18, "rig_view": "B", "rig_eval_split": "tracking"},
     ]
     failures = [{
         "source_ts": 10,

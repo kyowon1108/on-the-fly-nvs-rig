@@ -61,7 +61,7 @@ def load_metrics(path: Path) -> dict[str, Any]:
     views = sorted({str(r.get("rig_view", "")) for r in rows})
     test_views = sorted({str(r.get("rig_view", "")) for r in test_rows})
     test_timesteps = sorted({
-        int(r["rig_ts"]) for r in test_rows if r.get("rig_ts") is not None
+        int(r["source_ts"]) for r in test_rows if r.get("source_ts") is not None
     })
     split_meta = data.get("split", {})
     split_mode = split_meta.get(

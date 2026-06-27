@@ -11,14 +11,10 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 from pathlib import Path
 from typing import Any
 
 import numpy as np
-
-
-_TS_RE = re.compile(r"^(?P<view>.+)__ts(?P<ts>\d+)(?:\.[A-Za-z0-9]+)?$")
 
 
 def _as_path(path: str | Path) -> Path:
@@ -36,19 +32,11 @@ def center_from_w2c(rt: Any) -> np.ndarray:
 
 
 def parse_ts_and_view(info: dict[str, Any]) -> tuple[int, str]:
-    if "source_ts" in info:
-        return int(info["source_ts"]), str(info.get("rig_view", ""))
-    if "rig_ts" in info:
-        return int(info["rig_ts"]), str(info.get("rig_view", ""))
-    name = str(info.get("name", ""))
-    match = _TS_RE.match(name)
-    if not match:
-        raise ValueError(
-            "Cannot recover rig timestep from keyframe info. Expected saved "
-            "info['rig_ts'] or a name like '<view>__ts00037'. Got: "
-            f"{info!r}"
-        )
-    return int(match.group("ts")), match.group("view")
+    if "source_ts" not in info:
+        raise ValueError(f"Rig keyframe is missing source_ts: {info!r}")
+    if "rig_view" not in info:
+        raise ValueError(f"Rig keyframe is missing rig_view: {info!r}")
+    return int(info["source_ts"]), str(info["rig_view"])
 
 
 def load_estimated_centers(metadata_path: Path) -> tuple[np.ndarray, list[int], dict[str, float]]:
@@ -137,11 +125,7 @@ def evaluate(metadata_path: Path, gt_path: Path) -> dict[str, Any]:
     span = float(np.linalg.norm(gt.max(axis=0) - gt.min(axis=0)))
     ate_rmse = float(np.sqrt(np.mean(errors**2)))
 
-    completeness = (
-        metadata.get("rig", {}).get("completeness", {})
-        or metadata.get("extra", {}).get("rig_completeness", {})
-        or {}
-    )
+    completeness = metadata.get("rig", {}).get("completeness", {})
     result = {
         "metadata_path": str(metadata_path),
         "gt_centers_path": str(gt_path),

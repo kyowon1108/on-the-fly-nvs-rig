@@ -46,7 +46,7 @@ def _build_rig_completeness(expected, per_frame, failures, n_views):
     registered_by_split = {split: set() for split in ("train", "test", "tracking")}
     views_by_ts = {}
     for row in per_frame:
-        ts = int(row["rig_ts"])
+        ts = int(row["source_ts"])
         split = row.get("rig_eval_split", "train")
         if split in registered_by_split:
             registered_by_split[split].add(ts)
@@ -93,16 +93,16 @@ def _registered_rig_rows_from_keyframes(keyframes):
     rows = []
     for keyframe in keyframes:
         info = keyframe.info
-        if "rig_view" not in info or ("source_ts" not in info and "rig_ts" not in info):
+        if "rig_view" not in info:
             continue
-        ts = info["source_ts"] if "source_ts" in info else info["rig_ts"]
+        if "source_ts" not in info:
+            raise ValueError(f"Rig keyframe is missing source_ts: {info!r}")
+        if "rig_eval_split" not in info:
+            raise ValueError(f"Rig keyframe is missing rig_eval_split: {info!r}")
         rows.append({
-            "rig_ts": int(ts),
+            "source_ts": int(info["source_ts"]),
             "rig_view": info.get("rig_view"),
-            "rig_eval_split": info.get(
-                "rig_eval_split",
-                "test" if info.get("is_test", False) else "train",
-            ),
+            "rig_eval_split": info["rig_eval_split"],
         })
     return rows
 
@@ -171,11 +171,8 @@ if __name__ == "__main__":
     needs_reboot = False
     bootstrap_keyframe_dicts = []
     bootstrap_desc_kpts = []
-    # Rig mode: one N-view batch per timestep; the first B batches
-    # accumulate for rig bootstrap, then each subsequent batch is handled by
-    # rig-aware incremental PnP. `ref_kf_by_ts[ts]` caches the ref-view keyframe
-    # for debugging / downstream inspection.
-    ref_kf_by_ts = {}
+    # Rig mode: one N-view batch per timestep. The first B batches accumulate
+    # for bootstrap; each later packet is registered incrementally.
     bootstrap_rig_data = []
     n_rig_bootstrap_ts = 0
 
@@ -217,15 +214,22 @@ if __name__ == "__main__":
             if info["rig_view"] != dataset.ref_view:
                 raise RuntimeError(
                     "Rig dataset desync: expected a ref-view frame at batch "
-                    f"start, got view={info['rig_view']} ts={info['rig_ts']}"
+                    f"start, got view={info['rig_view']} "
+                    f"source_ts={info.get('source_ts')}"
                 )
-            ts = int(info.get("source_ts", info["rig_ts"]))
-            stream_idx = int(info.get("stream_idx", ts))
+            if "source_ts" not in info or "stream_idx" not in info:
+                raise RuntimeError(f"Rig ref frame missing source_ts/stream_idx: {info!r}")
+            ts = int(info["source_ts"])
+            stream_idx = int(info["stream_idx"])
             rig_batch = {dataset.ref_view: (image, info, detector(image))}
             for _ in range(len(dataset.non_ref_views)):
                 nr_img, nr_info = dataset.getnext()
-                nr_ts = int(nr_info.get("source_ts", nr_info["rig_ts"]))
-                nr_stream_idx = int(nr_info.get("stream_idx", nr_ts))
+                if "source_ts" not in nr_info or "stream_idx" not in nr_info:
+                    raise RuntimeError(
+                        f"Rig non-ref frame missing source_ts/stream_idx: {nr_info!r}"
+                    )
+                nr_ts = int(nr_info["source_ts"])
+                nr_stream_idx = int(nr_info["stream_idx"])
                 if nr_ts != ts or nr_stream_idx != stream_idx:
                     raise RuntimeError(
                         "rig batch desync: expected "
@@ -283,7 +287,6 @@ if __name__ == "__main__":
                         # (rig) tag info so Keyframe takes the rig branch: its pose is
                         # derived from scene_model.rig_R6D[ts_idx], not a free param.
                         inf["ts_idx"] = ts_i
-                        inf["rig_slot_idx"] = ts_i
                         inf["rig_view"] = v_name
                         kf = Keyframe(
                             img, inf, desc, Rt_view, n_keyframes, f_tensor,
@@ -293,7 +296,6 @@ if __name__ == "__main__":
                         first = (ts_i == 0 and v_name == view_order[0])
                         scene_model.add_keyframe(kf, f_tensor if first else None)
                         if v_name == dataset.ref_view:
-                            ref_kf_by_ts[data["ts"]] = kf
                             ref_kf_scene_indices.append(len(scene_model.keyframes) - 1)
                         n_keyframes += 1
                 increment_runtime(runtimes["Add"], start_time)
@@ -392,7 +394,6 @@ if __name__ == "__main__":
                 rel = inf["rig_relative_Rt"].to("cuda")
                 Rt_view = rel @ rig_pose
                 inf["ts_idx"] = new_ts_idx
-                inf["rig_slot_idx"] = new_ts_idx
                 inf["rig_view"] = v_name
                 kf = Keyframe(
                     img, inf, desc, Rt_view, n_keyframes, f_tensor,
@@ -400,8 +401,6 @@ if __name__ == "__main__":
                 )
                 scene_model.add_keyframe(kf)
                 new_scene_indices.append(len(scene_model.keyframes) - 1)
-                if v_name == dataset.ref_view:
-                    ref_kf_by_ts[ts] = kf
                 n_keyframes += 1
             # Rig timestamp packet semantics: all N views are registered before
             # spawn planning, and the Gaussian optimizer mutation is committed
@@ -670,7 +669,8 @@ if __name__ == "__main__":
                 img_np = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
                 cv2.imwrite(os.path.join(eval_dir, name), img_np)
                 per_frame.append({
-                    "name": name, "rig_ts": kf.info.get("rig_ts"),
+                    "name": name,
+                    "source_ts": int(kf.info["source_ts"]),
                     "rig_view": kf.info.get("rig_view"),
                     "rig_eval_split": kf.info.get(
                         "rig_eval_split",
@@ -703,15 +703,15 @@ if __name__ == "__main__":
                 "rig_train_timesteps_file": getattr(args, "rig_train_timesteps_file", ""),
                 "rig_test_timesteps_file": getattr(args, "rig_test_timesteps_file", ""),
                 "test_timesteps": sorted({
-                    int(x["rig_ts"]) for x in per_frame
+                    int(x["source_ts"]) for x in per_frame
                     if x.get("rig_eval_split") == "test"
                 }),
                 "train_timesteps": sorted({
-                    int(x["rig_ts"]) for x in per_frame
+                    int(x["source_ts"]) for x in per_frame
                     if x.get("rig_eval_split") == "train"
                 }),
                 "tracking_timesteps": sorted({
-                    int(x["rig_ts"]) for x in per_frame
+                    int(x["source_ts"]) for x in per_frame
                     if x.get("rig_eval_split") == "tracking"
                 }),
                 "test_views": sorted({
@@ -817,7 +817,7 @@ if __name__ == "__main__":
                 tl = [x["lpips"] for x in train_pf
                       if not (x["lpips"] != x["lpips"])]
                 if getattr(args, "rig_test_timesteps_file", ""):
-                    held_ts = sorted({int(x["rig_ts"]) for x in test_pf})
+                    held_ts = sorted({int(x["source_ts"]) for x in test_pf})
                     split_label = (
                         f"test timesteps={len(held_ts)} "
                         f"file={args.rig_test_timesteps_file}"

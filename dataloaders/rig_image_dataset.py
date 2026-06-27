@@ -169,16 +169,10 @@ class RigImageDataset:
             common &= set(self.frames_per_view[view])
         self.timestep_records = _build_timestep_records(common, int(args.start_at))
         self.timestep_names = [record["filename"] for record in self.timestep_records]
-        self.source_ts_by_name = {
-            record["filename"]: record["source_ts"]
-            for record in self.timestep_records
-        }
         self.stream_index = {
             record["filename"]: record["stream_idx"]
             for record in self.timestep_records
         }
-        # Backward-compatible name for code that only needs online ordering.
-        self.ts_index = self.stream_index
         self.num_timesteps = len(self.timestep_names)
 
         # Iteration order: every timestep emits a full N-view batch, ref first,
@@ -188,12 +182,12 @@ class RigImageDataset:
             fname = record["filename"]
             source_ts = record["source_ts"]
             stream_idx = record["stream_idx"]
-            self.items.append({"view": self.ref_view, "ts": source_ts,
+            self.items.append({"view": self.ref_view,
                                "source_ts": source_ts, "stream_idx": stream_idx,
                                "path": os.path.join(self.images_root, self.ref_view, fname),
                                "filename": fname})
             for view in self.non_ref_views:
-                self.items.append({"view": view, "ts": source_ts,
+                self.items.append({"view": view,
                                    "source_ts": source_ts, "stream_idx": stream_idx,
                                    "path": os.path.join(self.images_root, view, fname),
                                    "filename": fname})
@@ -276,7 +270,6 @@ class RigImageDataset:
                 "is_test": (eval_split != "train"),
                 "name": key,
                 "rig_view": item["view"],
-                "rig_ts": item["source_ts"],
                 "source_ts": item["source_ts"],
                 "stream_idx": item["stream_idx"],
                 "rig_eval_split": eval_split,

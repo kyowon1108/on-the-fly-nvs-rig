@@ -81,7 +81,9 @@ class Keyframe:
         # an independent pose parameter; scene_model.rig_optimizer owns the shared
         # SE(3) rig pose so all N views stay co-centered during optimization.
         self.rig_view = info.get("rig_view", None)
-        self.ts_idx = info.get("ts_idx", info.get("rig_slot_idx", None))
+        self.ts_idx = info.get("ts_idx", None)
+        if self.rig_view is not None and self.ts_idx is None:
+            raise ValueError(f"Rig keyframe is missing ts_idx: {info!r}")
         self.is_rig_mode = (self.rig_view is not None and self.ts_idx is not None)
         self.scene_model = None  # back-ref set by scene_model.add_keyframe (rig only)
 
@@ -419,14 +421,12 @@ class Keyframe:
         passthrough = [
             "name",
             "rig_view",
-            "rig_ts",
             "source_ts",
             "stream_idx",
             "rig_eval_split",
             "rig_filename",
             "image_path",
             "ts_idx",
-            "rig_slot_idx",
         ]
         for key in passthrough:
             if key in self.info:

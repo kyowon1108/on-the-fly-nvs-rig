@@ -35,7 +35,11 @@ def classify_rig_triangulation_partner(keyframes, target_info: dict, partner_id)
         return "invalid_id"
     partner = keyframes[partner_id]
     partner_info = getattr(partner, "info", {})
-    if partner_info.get("rig_ts") == target_info.get("rig_ts"):
+    target_ts = target_info.get("source_ts")
+    partner_ts = partner_info.get("source_ts")
+    if target_ts is None or partner_ts is None:
+        return "invalid_id"
+    if int(partner_ts) == int(target_ts):
         return "same_ts"
     split = partner_info.get("rig_eval_split")
     if partner_info.get("is_test", False) or split != "train":

@@ -33,14 +33,6 @@ def _load_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text())
 
 
-def _read_first_json(paths: list[Path]) -> dict[str, Any]:
-    for path in paths:
-        if path.exists():
-            return _load_json(path)
-    tried = "\n  - ".join(str(path) for path in paths)
-    raise FileNotFoundError(f"None of the expected JSON files exists:\n  - {tried}")
-
-
 def _center_from_w2c(rt: Any) -> tuple[float, float, float]:
     if len(rt) != 4 or any(len(row) != 4 for row in rt):
         raise ValueError("Expected 4x4 Rt")
@@ -51,11 +43,9 @@ def _center_from_w2c(rt: Any) -> tuple[float, float, float]:
 
 def _keyframe_source_ts(keyframe: dict[str, Any]) -> int:
     info = keyframe.get("info", {})
-    if "source_ts" in info:
-        return int(info["source_ts"])
-    if "rig_ts" in info:
-        return int(info["rig_ts"])
-    raise ValueError(f"Rig keyframe is missing source_ts/rig_ts: {info!r}")
+    if "source_ts" not in info:
+        raise ValueError(f"Rig keyframe is missing source_ts: {info!r}")
+    return int(info["source_ts"])
 
 
 def _center_spread_stats(metadata: dict[str, Any]) -> dict[str, Any]:
@@ -63,8 +53,10 @@ def _center_spread_stats(metadata: dict[str, Any]) -> dict[str, Any]:
     views: dict[int, set[str]] = {}
     for keyframe in metadata.get("keyframes", []):
         info = keyframe.get("info", {})
-        if "Rt" not in keyframe or ("source_ts" not in info and "rig_ts" not in info):
+        if "rig_view" not in info:
             continue
+        if "Rt" not in keyframe:
+            raise ValueError(f"Rig keyframe is missing Rt: {info!r}")
         ts = _keyframe_source_ts(keyframe)
         grouped.setdefault(ts, []).append(_center_from_w2c(keyframe["Rt"]))
         views.setdefault(ts, set()).add(str(info.get("rig_view", "")))
@@ -89,25 +81,17 @@ def _center_spread_stats(metadata: dict[str, Any]) -> dict[str, Any]:
 
 
 def _extract_completeness(metadata: dict[str, Any], run_dir: Path) -> dict[str, Any]:
-    eval_dir = run_dir / "render_eval"
-    return _read_first_json([
-        eval_dir / "rig_completeness.json",
-        run_dir / "rig_completeness.json",
-    ]) if (eval_dir / "rig_completeness.json").exists() or (run_dir / "rig_completeness.json").exists() else (
-        metadata.get("rig", {}).get("completeness", {})
-        or metadata.get("extra", {}).get("rig_completeness", {})
-    )
+    _ = metadata
+    return _load_json(run_dir / "render_eval" / "rig_completeness.json")
 
 
 def _extract_leakage_audit(metadata: dict[str, Any], run_dir: Path) -> dict[str, Any]:
-    eval_dir = run_dir / "render_eval"
-    return _read_first_json([
-        eval_dir / "rig_leakage_audit.json",
-        run_dir / "rig_leakage_audit.json",
-    ]) if (eval_dir / "rig_leakage_audit.json").exists() or (run_dir / "rig_leakage_audit.json").exists() else (
-        metadata.get("rig", {}).get("leakage_audit", {})
-        or metadata.get("extra", {}).get("rig_leakage_audit", {})
-    )
+    _ = metadata
+    return _load_json(run_dir / "render_eval" / "rig_leakage_audit.json")
+
+
+def _extract_incremental_refinement(metadata: dict[str, Any]) -> dict[str, Any]:
+    return metadata.get("extra", {}).get("rig_incremental_refinement", {})
 
 
 def _protocol_failures(
@@ -123,10 +107,18 @@ def _protocol_failures(
 
     leakage = _extract_leakage_audit(metadata, run_dir)
     completeness = _extract_completeness(metadata, run_dir)
+    refinement = _extract_incremental_refinement(metadata)
     if not leakage:
         failures.append("missing rig leakage audit")
     if not completeness:
         failures.append("missing rig completeness metadata")
+    if not refinement:
+        failures.append("missing rig incremental refinement metadata")
+    elif int(refinement.get("fallbacks", 0) or 0) != 0:
+        failures.append(
+            "rig incremental MiniBA fallback count must be 0, "
+            f"got {refinement.get('fallbacks')}"
+        )
 
     for key in ZERO_AUDIT_KEYS:
         if key not in leakage:
@@ -175,6 +167,7 @@ def _protocol_failures(
         "expected_num_views": expected_num_views,
         "leakage_audit": leakage,
         "completeness": completeness,
+        "rig_incremental_refinement": refinement,
         **spread_stats,
         "metrics_claim_test_exists": (eval_dir / "metrics_claim_test.json").exists(),
         "metrics_diagnostic_all_exists": (eval_dir / "metrics_diagnostic_all.json").exists(),

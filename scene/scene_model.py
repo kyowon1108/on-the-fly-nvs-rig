@@ -878,7 +878,7 @@ class SceneModel:
             candidate_idx = candidate_idx[keep_train]
         if exclude_ts is not None:
             keep = torch.tensor(
-                [self.keyframes[int(i)].info.get("rig_ts") != exclude_ts for i in candidate_idx],
+                [self.keyframes[int(i)].info.get("source_ts") != exclude_ts for i in candidate_idx],
                 device=candidate_idx.device,
             )
             candidate_idx = candidate_idx[keep]
@@ -1071,7 +1071,7 @@ class SceneModel:
             # rig view — picks the geometrically correct MVS partners.
             prev_KFs = self.get_prev_keyframes(
                 self.guided_mvs.n_cams + 1, update_3dpts=False,
-                exclude_ts=keyframe.info.get("rig_ts"),
+                exclude_ts=keyframe.info.get("source_ts"),
                 target_centre=cam_centre,
                 require_dense=True,
             )
@@ -1081,9 +1081,9 @@ class SceneModel:
                     break
             # (rig) same-ts exclusion safety net: prev_KFs must never share this
             # keyframe's rig timestamp (zero baseline -> degenerate depth).
-            _ex_ts = keyframe.info.get("rig_ts")
+            _ex_ts = keyframe.info.get("source_ts")
             if _ex_ts is not None:
-                same_ts_mvs = sum(p.info.get("rig_ts") == _ex_ts for p in prev_KFs)
+                same_ts_mvs = sum(p.info.get("source_ts") == _ex_ts for p in prev_KFs)
                 self.rig_leakage_audit["mvs_partner_count_same_ts"] += same_ts_mvs
                 assert same_ts_mvs == 0, \
                     "zero-baseline same-ts keyframe leaked into guided_mvs partners"
@@ -1288,7 +1288,7 @@ class SceneModel:
             for frame_id in self.active_frames_gpu:
                 if frame_id in protected_tail:
                     continue
-                ts = self.keyframes[frame_id].info.get("rig_ts")
+                ts = self.keyframes[frame_id].info.get("source_ts")
                 if ts is None:
                     continue
                 eligible_by_ts.setdefault(ts, []).append(frame_id)
