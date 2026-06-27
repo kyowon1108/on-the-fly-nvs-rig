@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Fail-fast checks for claim-grade OTF-Rig run artifacts.
+"""Fail-fast checks for protocol-safe OTF-Rig run artifacts.
 
 This script does not evaluate whether a scene looks good. It checks whether a
-rig run is safe to use for paper tables: no protocol leakage, no hidden missing
-timesteps, one complete view packet per timestep, and a dedicated test-split
-metric artifact.
+rig run satisfies the protocol invariants needed for reporting: no geometry
+leakage, no hidden missing timesteps, one complete view packet per timestep,
+and separate test-split and diagnostic metric artifacts.
 """
 
 from __future__ import annotations
@@ -110,7 +110,7 @@ def _extract_leakage_audit(metadata: dict[str, Any], run_dir: Path) -> dict[str,
     )
 
 
-def _failures_for_claim(
+def _protocol_failures(
     run_dir: Path,
     expected_num_views: int,
     max_center_spread: float,
@@ -162,7 +162,7 @@ def _failures_for_claim(
         )
 
     if not (eval_dir / "metrics_claim_test.json").exists():
-        failures.append(f"missing claim metric: {eval_dir / 'metrics_claim_test.json'}")
+        failures.append(f"missing test metric artifact: {eval_dir / 'metrics_claim_test.json'}")
     if not (eval_dir / "metrics_diagnostic_all.json").exists():
         failures.append(f"missing diagnostic metric: {eval_dir / 'metrics_diagnostic_all.json'}")
 
@@ -188,7 +188,7 @@ def main() -> None:
     args = parser.parse_args()
 
     run_dir = Path(args.run).expanduser().resolve()
-    failures, summary = _failures_for_claim(
+    failures, summary = _protocol_failures(
         run_dir=run_dir,
         expected_num_views=args.expected_num_views,
         max_center_spread=args.max_center_spread,
@@ -200,12 +200,12 @@ def main() -> None:
         )
 
     if failures:
-        print("Rig claim artifact check FAILED:")
+        print("Rig protocol artifact check FAILED:")
         for failure in failures:
             print(f"  - {failure}")
         raise SystemExit(1)
 
-    print("Rig claim artifact check OK")
+    print("Rig protocol artifact check OK")
     print(
         "  "
         f"views/timestep={summary['views_per_ts_min']}..{summary['views_per_ts_max']}, "

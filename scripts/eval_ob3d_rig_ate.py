@@ -220,7 +220,7 @@ def main() -> None:
     missing = _missing_from_result(result)
     if args.fail_on_missing and missing:
         raise SystemExit(
-            "Missing expected rig timesteps; refusing to report claim-grade ATE: "
+            "Missing expected rig timesteps; refusing to report protocol-safe ATE: "
             f"{missing}"
         )
 

@@ -1,7 +1,7 @@
 """Lightweight rig triangulation partner policy.
 
-This module deliberately avoids importing scene/keyframe/feature code so P0
-protocol checks can run on CPU without loading CUDA/CuPy-backed matchers.
+This module deliberately avoids importing scene/keyframe/feature code so the
+rig protocol checks can run on CPU without loading CUDA/CuPy-backed matchers.
 """
 
 RIG_TRIANGULATION_AUDIT_KEYS = (

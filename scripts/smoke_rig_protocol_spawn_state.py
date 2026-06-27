@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Smoke checks for P0-2 non-train Gaussian spawn state isolation."""
+"""Smoke checks for non-train Gaussian spawn state isolation."""
 
 from __future__ import annotations
 
@@ -110,7 +110,7 @@ def test_train_keyframe_still_enters_existing_path() -> None:
 def main() -> None:
     test_non_train_spawn_state_is_unchanged()
     test_train_keyframe_still_enters_existing_path()
-    print("P0-2 rig spawn state smoke passed")
+    print("rig spawn-state protocol smoke passed")
 
 
 if __name__ == "__main__":

@@ -38,7 +38,7 @@ from utils import align_mean_up_fwd, increment_runtime, mtx2sixD
 
 
 def _build_rig_completeness(expected, per_frame, failures, n_views):
-    """Build split-wise source-timestep completeness for claim-grade rig eval."""
+    """Build split-wise source-timestep completeness for rig reporting."""
     expected = {
         split: sorted({int(ts) for ts in expected.get(split, [])})
         for split in ("all", "train", "test", "tracking")
@@ -389,7 +389,7 @@ if __name__ == "__main__":
             # spawn planning, and the Gaussian optimizer mutation is committed
             # once after planning. This prevents later views from seeing an
             # already-mutated scene state; stochastic proposal order is not
-            # claimed to be bitwise invariant.
+            # treated as bitwise invariant.
             scene_model.add_new_gaussians_for_keyframes(new_scene_indices)
             increment_runtime(runtimes["Add"], start_time)
             start_time = time.time()
@@ -717,7 +717,7 @@ if __name__ == "__main__":
                 f"(range PSNR {summary['psnr_min']:.2f}–{summary['psnr_max']:.2f})"
             )
             # Rig NVS metric: split optimized training frames from held-out
-            # frames. `--rig_test_timesteps_file` is the claim-grade OB3D-style
+            # frames. `--rig_test_timesteps_file` is the OB3D-style
             # split (all N virtual views from held-out EQR timesteps). The older
             # `--rig_holdout_view` split is a diagnostic for unseen direction at
             # seen timesteps.

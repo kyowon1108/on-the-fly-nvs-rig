@@ -76,14 +76,10 @@ class Keyframe:
         self.info = info
         self.is_test = info["is_test"]
 
-        # RIG MODE: the keyframe pose is DERIVED from the shared per-timestep
-        # rig pose (scene_model.rig_R6D[ts]/rig_t[ts]) on every forward as
-        # view_w2c = rel @ rig — it is NOT an independent nn.Parameter. This keeps
-        # the N views of a timestamp rigidly co-centered (rel_t = 0 EXACTLY)
-        # throughout photometric optimization (the rotation-only rig invariant).
-        # The optimizable rig pose is owned by scene_model.rig_optimizer
-        # (register_rig_poses / append_rig_pose). Per-view independent pose
-        # optimization would let the N views drift apart and break the rig.
+        # Rig mode derives each view pose from the shared timestep pose:
+        # view_w2c = rel @ rig_w2c, with rel_t = 0. The view keyframe does not own
+        # an independent pose parameter; scene_model.rig_optimizer owns the shared
+        # SE(3) rig pose so all N views stay co-centered during optimization.
         self.rig_view = info.get("rig_view", None)
         self.ts_idx = info.get("ts_idx", info.get("rig_slot_idx", None))
         self.is_rig_mode = (self.rig_view is not None and self.ts_idx is not None)
@@ -91,8 +87,8 @@ class Keyframe:
 
         # Optimizable parameters
         if self.is_rig_mode:
-            # inert plain tensors (the optimizable pose lives in scene_model);
-            # rel_R/rel_t are the FIXED intra-rig extrinsics (rel_t == 0).
+            # Inert tensors: the optimizable pose lives in scene_model. rel_R/rel_t
+            # are the fixed intra-rig extrinsics, with rel_t=0 for this virtual rig.
             self.rW2C = Rt[:3, :2].clone()
             self.tW2C = Rt[:3, 3].clone()
             self.rel_R = info["rig_relative_Rt"][:3, :3].clone().to("cuda")

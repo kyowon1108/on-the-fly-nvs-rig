@@ -49,7 +49,7 @@ def _validate_rig_args(args, parser):
     if args.rig_holdout_view and (args.rig_test_timesteps_file or args.rig_train_timesteps_file):
         forbidden.append(
             "--rig_holdout_view and rig timestep split files are mutually "
-            "exclusive; use timestep holdout for claim-grade OB3D NVS metrics "
+            "exclusive; use timestep holdout for OB3D report metrics "
             "and view holdout only as a diagnostic."
         )
 
@@ -129,7 +129,7 @@ def get_args():
     parser.add_argument('--enable_reboot', action='store_true',
                         help="Non-rig diagnostic: reboot local initialization after "
                              "tracking failure. Do not use as a hidden default for "
-                             "rig claims; rig reboot needs timestep-aware state reset.")
+                             "rig reporting; rig reboot needs timestep-aware state reset.")
     # Focal estimation
     parser.add_argument('--fix_focal', action='store_true', 
                         help="If set, will use init_focal or init_fov without reoptimizing focal")
@@ -188,10 +188,10 @@ def get_args():
     parser.add_argument('--rig_holdout_view', type=str, default="",
                         help="If set (e.g. 'Low_Cam08'), this view is excluded from "
                              "Gaussian optimization but kept for pose estimation and "
-                             "post-hoc evaluation. Diagnostic only: claim-grade OB3D "
+                             "post-hoc evaluation. Diagnostic only: OB3D report "
                              "NVS uses --rig_test_timesteps_file.")
     parser.add_argument('--rig_test_timesteps_file', type=str, default="",
-                        help="Rig-only claim-grade holdout split. File contains "
+                        help="Rig-only timestep holdout split. File contains "
                              "original OB3D timestep indices or frame names; every "
                              "view at those timesteps is excluded from Gaussian "
                              "optimization but kept for online pose tracking and "

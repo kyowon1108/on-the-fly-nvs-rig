@@ -107,13 +107,11 @@ class SceneModel:
         self.anchor_overlap = args.anchor_overlap
         self.use_rig = getattr(args, "use_rig", False)
         self.freeze_rig_poses = getattr(args, "freeze_rig_poses", False)
-        # Rig-pose ownership (rotation-only rig): the photometric optimizer owns
-        # one shared SE(3) rig pose per timestep, represented by a 6D rotation
-        # parameter plus a 3D translation. Each view pose is derived as rel @ rig
-        # (rel_t=0), so the N views of a ts stay rigidly co-centered through
-        # optimization. register_rig_poses (bootstrap) / append_rig_pose
-        # (incremental) populate these. When rig_optimizer is set, get_Rts()
-        # bypasses the Rt cache because poses change every iteration.
+        # Rig mode owns one shared SE(3) pose per timestep (6D rotation parameter
+        # plus 3D translation). Each virtual view derives pose as rel @ rig with
+        # rel_t=0, so all views from the same source panorama remain co-centered.
+        # When rig_optimizer is active, get_Rts() bypasses the Rt cache because
+        # the shared poses can change every iteration.
         self.rig_R6D = torch.nn.ParameterList()
         self.rig_t = torch.nn.ParameterList()
         self.rig_optimizer = None
@@ -375,11 +373,10 @@ class SceneModel:
     def rig_triangulation_allowed_ids(self, target_keyframe: Keyframe) -> list[int]:
         """Return split-safe, cross-timestep triangulation partners for a rig keyframe.
 
-        `desc_kpts.matches` is a persistent cache and may contain same-timestep,
-        test/tracking, or temporary ids created by online PnP matching. This
-        method is the claim-grade filter used immediately before triangulation.
-        Candidate leakage is counted for diagnostics; only train/cross-ts/valid
-        ids are returned.
+        `desc_kpts.matches` is persistent and may contain same-timestep,
+        test/tracking, or temporary ids from online PnP. Count those candidates
+        for diagnostics, but only return valid train partners from a different
+        source timestep.
         """
         return collect_allowed_rig_triangulation_ids(
             self.keyframes,

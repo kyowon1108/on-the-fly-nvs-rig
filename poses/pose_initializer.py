@@ -388,11 +388,10 @@ class PoseInitializer():
             hi = (v_idx + 1) * npts_per_view
             uv[lo:hi, :, v_idx, :] = uvs_v
 
-            # Seed xyz from each point's first valid observation using unit depth
-            # along the camera axis, then lift into the rig frame. Depth Anything
-            # remains part of the normal OTF depth loss / guided-MVS path, but the
-            # fork-local mono-depth bootstrap seed is intentionally not part of the
-            # rig convention.
+            # Seed xyz from the first valid observation at unit camera-axis depth,
+            # then lift it into the shared rig frame. Monocular depth is still used
+            # later for depth regularization / guided MVS, but bootstrap geometry
+            # stays independent of that prior by default.
             valid = (uvs_v >= 0).all(dim=-1)  # (npts_per_view, N_ts)
             for p in range(npts_per_view):
                 ts_hits = valid[p].nonzero(as_tuple=False).flatten()

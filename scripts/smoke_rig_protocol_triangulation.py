@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CPU-only smoke checks for OTF-rig P0-1 triangulation filtering."""
+"""CPU-only smoke checks for split-safe rig triangulation filtering."""
 
 from __future__ import annotations
 
@@ -124,7 +124,7 @@ def main() -> None:
     test_prepare_matches_allowed_filter()
     test_rig_partner_policy_and_actual_use_assert()
     test_no_valid_train_cross_ts_partner_is_empty_and_non_mutating()
-    print("P0-1 rig triangulation smoke passed")
+    print("rig triangulation protocol smoke passed")
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Smoke-test P0-4 rig timestep semantics without loading CUDA images."""
+"""Smoke-test rig source timestep and stream-order semantics without CUDA images."""
 
 from __future__ import annotations
 
@@ -48,7 +48,7 @@ def main() -> None:
     else:
         raise AssertionError("duplicate source timesteps must be rejected")
 
-    print("P0-4 rig timestep semantics smoke passed")
+    print("rig timestep-semantics protocol smoke passed")
 
 
 if __name__ == "__main__":

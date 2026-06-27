@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Smoke-test P0-3 rig completeness accounting."""
+"""Smoke-test rig registration completeness accounting."""
 
 from __future__ import annotations
 
@@ -46,7 +46,7 @@ def main() -> None:
     assert completeness["views_per_timestep_min"] == 2
     assert completeness["views_per_timestep_max"] == 2
 
-    print("P0-3 rig completeness smoke passed")
+    print("rig completeness protocol smoke passed")
 
 
 if __name__ == "__main__":
