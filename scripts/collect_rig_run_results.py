@@ -54,22 +54,74 @@ def infer_scene(run: Path, metadata: dict[str, Any]) -> str:
     return run.name
 
 
+def count_completeness(completeness: dict[str, Any], key: str) -> int | str:
+    return len(completeness.get(key, [])) if completeness else ""
+
+
 def collect_one(run: Path) -> dict[str, Any]:
     metadata = read_json(run / "metadata.json")
     ate = read_json(run / "ate_ob3d_rig.json")
     split = read_json(run / "render_eval" / "split_metrics.json")
-    train = split.get("train_views", {})
-    test = split.get("test_frames", split.get("holdout_views_summary", {}))
-    tracking = split.get("tracking_frames", {})
-    all_views = split.get("all_views", {})
+    completeness = (
+        read_json(run / "rig_completeness.json")
+        or metadata.get("rig", {}).get("completeness", {})
+        or metadata.get("extra", {}).get("rig_completeness", {})
+        or split.get("rig_completeness", {})
+    )
+    leakage = (
+        read_json(run / "rig_leakage_audit.json")
+        or metadata.get("rig", {}).get("leakage_audit", {})
+        or metadata.get("extra", {}).get("rig_leakage_audit", {})
+        or split.get("rig_leakage_audit", {})
+    )
+    train = split.get("train_views", split.get("train", {}))
+    test = split.get(
+        "test_frames",
+        split.get("holdout_views_summary", split.get("test", {})),
+    )
+    tracking = split.get("tracking_frames", split.get("tracking", {}))
+    all_views = split.get("all_views", split.get("all", {}))
+    split_mode = split.get("split_mode", split.get("split", {}).get("mode", ""))
     return {
         "run": str(run),
         "scene": infer_scene(run, metadata),
         "ablation": infer_ablation(run),
-        "render_split_mode": split.get("split_mode", ""),
+        "render_split_mode": split_mode,
         "num_keyframes": metadata.get("num keyframes", ""),
         "runtime_sec": metadata.get("time", ""),
         "fps": metadata.get("FPS", ""),
+        "fps_unit": metadata.get("FPS_unit", ""),
+        "images_per_sec": metadata.get("images/sec", ""),
+        "registered_expected_all": (
+            f"{len(completeness.get('registered_timesteps_all', []))}/"
+            f"{len(completeness.get('expected_timesteps_all', []))}"
+            if completeness else ""
+        ),
+        "registered_expected_test": (
+            f"{len(completeness.get('registered_timesteps_test', []))}/"
+            f"{len(completeness.get('expected_timesteps_test', []))}"
+            if completeness else ""
+        ),
+        "missing_timesteps_all": count_completeness(
+            completeness, "missing_timesteps_all"
+        ),
+        "missing_timesteps_test": count_completeness(
+            completeness, "missing_timesteps_test"
+        ),
+        "registration_recall_all": completeness.get("registration_recall_all", ""),
+        "registration_recall_test": completeness.get("registration_recall_test", ""),
+        "triangulation_partner_count_same_ts": leakage.get(
+            "triangulation_partner_count_same_ts", ""
+        ),
+        "triangulation_partner_count_test": leakage.get(
+            "triangulation_partner_count_test", ""
+        ),
+        "triangulation_partner_count_tracking": leakage.get(
+            "triangulation_partner_count_tracking", ""
+        ),
+        "triangulation_partner_count_invalid_id": leakage.get(
+            "triangulation_partner_count_invalid_id", ""
+        ),
         "registered_timesteps": ate.get("num_timesteps", ""),
         "views_per_ts_min": ate.get("views_per_ts_min", ""),
         "views_per_ts_max": ate.get("views_per_ts_max", ""),
