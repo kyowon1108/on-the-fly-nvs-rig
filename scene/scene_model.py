@@ -194,6 +194,15 @@ class SceneModel:
         self.valid_keyframes = torch.empty(0, dtype=torch.bool)
         self.lock = threading.Lock()
         self.inference_mode = inference_mode
+        self.extra_metadata = {}
+        self.rig_expected_timesteps = {
+            "all": [],
+            "train": [],
+            "test": [],
+            "tracking": [],
+        }
+        self.rig_failed_timesteps = []
+        self.rig_completeness = {}
         self.rig_leakage_audit = _make_rig_protocol_audit()
 
         ## Initialize helpers for Gaussian initialization
@@ -311,7 +320,35 @@ class SceneModel:
             i for i in self.active_frames_gpu
             if not self.keyframes[i].info.get("is_test", False)
         ]
-        return train_frames if train_frames else self.active_frames_gpu
+        return train_frames
+
+    def set_rig_view_count(self, n_views: int):
+        """Set N for the rig and keep frame-count windows timestep-aligned."""
+        self.n_rig_views = int(n_views)
+        if self.use_rig:
+            self.n_kept_frames = self.n_kept_timesteps * self.n_rig_views
+
+    def set_rig_expected_timesteps(self, expected: dict[str, list[int]]):
+        """Set the source-timestep universe used by completeness reports."""
+        self.rig_expected_timesteps = {
+            split: sorted({int(ts) for ts in expected.get(split, [])})
+            for split in ("all", "train", "test", "tracking")
+        }
+
+    def record_rig_timestep_failure(
+        self,
+        source_ts: int,
+        stream_idx: int,
+        split: str,
+        reason: str,
+    ):
+        """Record a timestep that failed online registration and was skipped."""
+        self.rig_failed_timesteps.append({
+            "source_ts": int(source_ts),
+            "stream_idx": int(stream_idx),
+            "split": str(split),
+            "reason": str(reason),
+        })
 
     def _classify_rig_partner(self, target_keyframe: Keyframe, partner_id: int) -> str:
         return classify_rig_triangulation_partner(
@@ -485,10 +522,17 @@ class SceneModel:
         self.optimization_thread.start()
 
     @torch.no_grad()
+    def _is_metric_test_keyframe(self, keyframe: Keyframe) -> bool:
+        """True only for frames that should enter held-out image metrics."""
+        if self.use_rig:
+            return keyframe.info.get("rig_eval_split") == "test"
+        return bool(keyframe.info.get("is_test", False))
+
+    @torch.no_grad()
     def harmonize_test_exposure(self):
         """Harmonizes the exposure matrices of test keyframes by averaging the exposure of the previous and next keyframes."""
         for index, keyframe in enumerate(self.keyframes):
-            if keyframe.info["is_test"]:
+            if self._is_metric_test_keyframe(keyframe):
                 idxm = index - 1 if index != 0 else 1
                 idxp = (
                     index + 1
@@ -1335,6 +1379,27 @@ class SceneModel:
             ],
             "keyframes": [keyframe.to_json() for keyframe in self.keyframes],
         }
+        if self.use_rig:
+            rig_leakage_audit = dict(self.rig_leakage_audit)
+            metadata["rig"] = {
+                "num_timesteps": len(self.rig_R6D),
+                "num_views": self.n_rig_views,
+                "metric_policy": "rig_eval_split == 'test'",
+                "completeness": getattr(self, "rig_completeness", {}),
+                "split_counts": {
+                    split: sum(
+                        1 for keyframe in self.keyframes
+                        if keyframe.info.get("rig_eval_split") == split
+                    )
+                    for split in ("train", "test", "tracking")
+                },
+                "leakage_audit": rig_leakage_audit,
+            }
+            self.extra_metadata["rig_leakage_audit"] = rig_leakage_audit
+            if getattr(self, "rig_completeness", None):
+                self.extra_metadata["rig_completeness"] = self.rig_completeness
+        if self.extra_metadata:
+            metadata["extra"] = self.extra_metadata
         metadata = {**metrics, **metadata}
 
         with open(os.path.join(path, "metadata.json"), "w") as f:

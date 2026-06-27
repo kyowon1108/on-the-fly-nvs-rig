@@ -315,6 +315,34 @@ class RigImageDataset:
     def get_image_size(self):
         return self.height, self.width
 
+    def get_expected_timestep_splits(self) -> dict[str, list[int]]:
+        """Return source-timestep universes for completeness accounting."""
+        all_ts = sorted({record["source_ts"] for record in self.timestep_records})
+        if self.train_timesteps and self.test_timesteps:
+            train_ts = sorted(self.train_timesteps)
+            test_ts = sorted(self.test_timesteps)
+            tracking_ts = sorted(set(all_ts) - self.train_timesteps - self.test_timesteps)
+        elif self.test_timesteps:
+            test_ts = sorted(self.test_timesteps)
+            train_ts = sorted(set(all_ts) - self.test_timesteps)
+            tracking_ts = []
+        elif self.holdout_view:
+            # View-holdout is diagnostic: every timestep has both train views
+            # and one held-out direction, so the timestep universe overlaps.
+            train_ts = all_ts
+            test_ts = all_ts
+            tracking_ts = []
+        else:
+            train_ts = all_ts
+            test_ts = []
+            tracking_ts = []
+        return {
+            "all": all_ts,
+            "train": train_ts,
+            "test": test_ts,
+            "tracking": tracking_ts,
+        }
+
     @torch.no_grad()
     def __getitem__(self, index: int):
         item = self.items[index]

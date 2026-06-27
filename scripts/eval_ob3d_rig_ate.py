@@ -126,6 +126,7 @@ def umeyama_sim3(est: np.ndarray, gt: np.ndarray) -> tuple[float, np.ndarray, np
 
 
 def evaluate(metadata_path: Path, gt_path: Path) -> dict[str, Any]:
+    metadata = json.loads(metadata_path.read_text())
     est, ts_list, spread_stats = load_estimated_centers(metadata_path)
     gt = load_gt_centers(gt_path, ts_list)
     scale, rotation, translation = umeyama_sim3(est, gt)
@@ -134,7 +135,12 @@ def evaluate(metadata_path: Path, gt_path: Path) -> dict[str, Any]:
     span = float(np.linalg.norm(gt.max(axis=0) - gt.min(axis=0)))
     ate_rmse = float(np.sqrt(np.mean(errors**2)))
 
-    return {
+    completeness = (
+        metadata.get("rig", {}).get("completeness", {})
+        or metadata.get("extra", {}).get("rig_completeness", {})
+        or {}
+    )
+    result = {
         "metadata_path": str(metadata_path),
         "gt_centers_path": str(gt_path),
         "num_timesteps": len(ts_list),
@@ -149,6 +155,27 @@ def evaluate(metadata_path: Path, gt_path: Path) -> dict[str, Any]:
         "ATE_RMSE_pct_span": float(100.0 * ate_rmse / max(span, 1e-12)),
         "Sim3_scale_est_to_gt": scale,
     }
+    if completeness:
+        result["rig_completeness"] = completeness
+        result["registered_expected_all"] = (
+            f"{len(completeness.get('registered_timesteps_all', []))}/"
+            f"{len(completeness.get('expected_timesteps_all', []))}"
+        )
+        result["registered_expected_test"] = (
+            f"{len(completeness.get('registered_timesteps_test', []))}/"
+            f"{len(completeness.get('expected_timesteps_test', []))}"
+        )
+        result["missing_timesteps_all"] = completeness.get("missing_timesteps_all", [])
+        result["missing_timesteps_test"] = completeness.get("missing_timesteps_test", [])
+        result["registration_recall_all"] = completeness.get("registration_recall_all")
+        result["registration_recall_test"] = completeness.get("registration_recall_test")
+    return result
+
+
+def _missing_from_result(result: dict[str, Any]) -> list[int]:
+    completeness = result.get("rig_completeness") or {}
+    missing = completeness.get("missing_timesteps_all", [])
+    return [int(ts) for ts in missing]
 
 
 def main() -> None:
@@ -168,6 +195,11 @@ def main() -> None:
         default="",
         help="Output JSON path. Defaults to <run>/ate_ob3d_rig.json.",
     )
+    parser.add_argument(
+        "--fail-on-missing",
+        action="store_true",
+        help="Exit non-zero when metadata reports missing expected rig timesteps.",
+    )
     args = parser.parse_args()
 
     run_path = _as_path(args.run)
@@ -185,6 +217,12 @@ def main() -> None:
         else metadata_path.parent / "ate_ob3d_rig.json"
     )
     output_path.write_text(json.dumps(result, indent=2) + "\n")
+    missing = _missing_from_result(result)
+    if args.fail_on_missing and missing:
+        raise SystemExit(
+            "Missing expected rig timesteps; refusing to report claim-grade ATE: "
+            f"{missing}"
+        )
 
     print(
         "OB3D rig ATE: "
@@ -193,6 +231,13 @@ def main() -> None:
         f"({result['ATE_RMSE_pct_span']:.4f}% span), "
         f"same-ts spread max={result['same_ts_spread_max_m']:.3e} m"
     )
+    if "registered_expected_all" in result:
+        print(
+            "Completeness: "
+            f"all={result['registered_expected_all']} "
+            f"test={result['registered_expected_test']} "
+            f"missing_test={len(result.get('missing_timesteps_test', []))}"
+        )
     print(f"Wrote {output_path}")
 
 

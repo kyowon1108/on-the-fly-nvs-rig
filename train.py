@@ -36,6 +36,59 @@ from webviewer.webviewer import WebViewer
 from graphdecoviewer.types import ViewerMode
 from utils import align_mean_up_fwd, increment_runtime, mtx2sixD
 
+
+def _build_rig_completeness(expected, per_frame, failures, n_views):
+    """Build split-wise source-timestep completeness for claim-grade rig eval."""
+    expected = {
+        split: sorted({int(ts) for ts in expected.get(split, [])})
+        for split in ("all", "train", "test", "tracking")
+    }
+    registered_by_split = {split: set() for split in ("train", "test", "tracking")}
+    views_by_ts = {}
+    for row in per_frame:
+        ts = int(row["rig_ts"])
+        split = row.get("rig_eval_split", "train")
+        if split in registered_by_split:
+            registered_by_split[split].add(ts)
+        views_by_ts.setdefault(ts, set()).add(row.get("rig_view", ""))
+
+    registered_all = set().union(*registered_by_split.values())
+    failed_by_split = {split: set() for split in ("train", "test", "tracking")}
+    failed_all = set()
+    for failure in failures:
+        ts = int(failure["source_ts"])
+        split = failure.get("split", "tracking")
+        failed_all.add(ts)
+        if split in failed_by_split:
+            failed_by_split[split].add(ts)
+
+    def _recall(split, registered):
+        exp = set(expected[split])
+        return float(len(exp & registered) / len(exp)) if exp else 1.0
+
+    view_counts = [len(v) for v in views_by_ts.values()]
+    completeness = {
+        "views_per_timestep_expected": int(n_views),
+        "expected_timesteps_all": expected["all"],
+        "registered_timesteps_all": sorted(registered_all),
+        "failed_timesteps_all": sorted(failed_all),
+        "missing_timesteps_all": sorted(set(expected["all"]) - registered_all),
+        "failed_timestep_records": list(failures),
+        "views_per_timestep_min": int(min(view_counts)) if view_counts else 0,
+        "views_per_timestep_max": int(max(view_counts)) if view_counts else 0,
+    }
+    for split in ("train", "test", "tracking"):
+        registered = registered_by_split[split]
+        exp = set(expected[split])
+        completeness[f"expected_timesteps_{split}"] = expected[split]
+        completeness[f"registered_timesteps_{split}"] = sorted(registered)
+        completeness[f"failed_timesteps_{split}"] = sorted(failed_by_split[split])
+        completeness[f"missing_timesteps_{split}"] = sorted(exp - registered)
+        completeness[f"registration_recall_{split}"] = _recall(split, registered)
+    completeness["registration_recall_all"] = _recall("all", registered_all)
+    return completeness
+
+
 if __name__ == "__main__":
     args = get_args()
     torch.random.manual_seed(args.seed)
@@ -73,7 +126,8 @@ if __name__ == "__main__":
     if args.use_rig:
         # N-view-aware active window: tell scene_model how many views per timestep
         # so n_kept_frames scales as n_kept_timesteps * N (6/9/12/15-view rigs).
-        scene_model.n_rig_views = len(dataset.rig.view_names)
+        scene_model.set_rig_view_count(len(dataset.rig.view_names))
+        scene_model.set_rig_expected_timesteps(dataset.get_expected_timestep_splits())
     detector = Detector(args.num_kpts, width, height)
 
     # Initialize the viewer
@@ -286,6 +340,12 @@ if __name__ == "__main__":
             )
             increment_runtime(runtimes["BAI"], start_time)
             if rig_pose is None:
+                scene_model.record_rig_timestep_failure(
+                    source_ts=ts,
+                    stream_idx=stream_idx,
+                    split=info.get("rig_eval_split", "tracking"),
+                    reason="initialize_incremental_rig returned None",
+                )
                 continue
 
             # (rig) Append this ts's rig pose as a new optimizer slot (moments of
@@ -650,6 +710,68 @@ if __name__ == "__main__":
             tracking_pf = [
                 x for x in per_frame if x.get("rig_eval_split") == "tracking"
             ]
+            rig_completeness = _build_rig_completeness(
+                scene_model.rig_expected_timesteps,
+                per_frame,
+                scene_model.rig_failed_timesteps,
+                len(dataset.rig.view_names),
+            )
+            scene_model.rig_completeness = rig_completeness
+            scene_model.extra_metadata["rig_completeness"] = rig_completeness
+            def _summarize_rows(rows):
+                if not rows:
+                    return {
+                        "num_frames": 0,
+                        "psnr_mean": float("nan"),
+                        "ssim_mean": float("nan"),
+                        "lpips_mean": float("nan"),
+                    }
+                rp = [x["psnr"] for x in rows]
+                rs = [x["ssim"] for x in rows]
+                rl = [x["lpips"] for x in rows
+                      if not (x["lpips"] != x["lpips"])]
+                return {
+                    "num_frames": len(rows),
+                    "psnr_mean": float(np.mean(rp)),
+                    "ssim_mean": float(np.mean(rs)),
+                    "lpips_mean": (float(np.mean(rl)) if rl else float("nan")),
+                }
+
+            split_metrics = {
+                "all": summary,
+                "test": _summarize_rows(test_pf),
+                "train": _summarize_rows(train_pf),
+                "tracking": _summarize_rows(tracking_pf),
+                "split": split_meta,
+                "rig_leakage_audit": dict(scene_model.rig_leakage_audit),
+                "rig_completeness": rig_completeness,
+            }
+            with open(os.path.join(eval_dir, "split_metrics.json"), "w") as _f:
+                _json.dump(split_metrics, _f, indent=2)
+            with open(os.path.join(eval_dir, "metrics_claim_test.json"), "w") as _f:
+                _json.dump(split_metrics["test"], _f, indent=2)
+            with open(os.path.join(eval_dir, "metrics_diagnostic_all.json"), "w") as _f:
+                _json.dump(split_metrics["all"], _f, indent=2)
+            with open(os.path.join(eval_dir, "metrics_diagnostic_tracking.json"), "w") as _f:
+                _json.dump(split_metrics["tracking"], _f, indent=2)
+            with open(os.path.join(eval_dir, "rig_leakage_audit.json"), "w") as _f:
+                _json.dump(split_metrics["rig_leakage_audit"], _f, indent=2)
+            with open(os.path.join(eval_dir, "rig_completeness.json"), "w") as _f:
+                _json.dump(rig_completeness, _f, indent=2)
+            with open(os.path.join(eval_dir, "metrics.json"), "w") as _f:
+                _json.dump(
+                    {
+                        "summary": summary,
+                        "test_summary": split_metrics["test"],
+                        "train_summary": split_metrics["train"],
+                        "rig_leakage_audit": split_metrics["rig_leakage_audit"],
+                        "rig_completeness": rig_completeness,
+                        "split": split_meta,
+                        "per_frame": per_frame,
+                    },
+                    _f,
+                    indent=2,
+                )
             if test_pf:
                 hp = [x["psnr"] for x in test_pf]
                 hs = [x["ssim"] for x in test_pf]
