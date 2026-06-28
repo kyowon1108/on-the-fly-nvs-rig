@@ -1,20 +1,19 @@
 """Rig-aware MiniBA.
 
-Keeps the structure of mini_ba.MiniBA (autograd jacfwd, LM+Schur, CUDA graph)
-but changes the meaning of the "camera" dimension:
+`mini_ba.MiniBA`의 구조(autograd jacfwd, LM+Schur, CUDA graph)는 유지하되,
+"camera" 축의 의미를 rig timestep으로 바꾼다.
 
-- Observations are indexed by (timestep, view). There are n_obs = n_ts * n_views
-  observations per 3D point.
-- Optimizable camera parameters are `rig_pose` per timestep — there are
-  n_opt_rig = n_ts of them (6D rotation + 3D translation = 9 params each).
-- Per-view relative transforms `rel_R[view]` / `rel_t[view]` are fixed; each
-  observation's world-to-camera pose is `view_w2c = rel[view] @ rig[ts]`.
-- Cross-term zeroing: the Jacobian of observation (ts, view) wrt rig_pose[k]
-  is non-zero only when k == ts. Same block-diagonal trick as mini_ba.py, but
-  keyed on `ts_of_obs = obs_idx // n_views` instead of `cam_idx`.
+- Observation은 `(timestep, view)`로 index된다. 3D point 하나당
+  `n_obs = n_ts * n_views`개의 observation이 있다.
+- 최적화 camera parameter는 timestep별 `rig_pose`뿐이다. 각 pose는 raw parameter
+  기준 6D rotation + 3D translation = 9개 값이지만, 기하학적 pose는 SE(3)다.
+- View별 `rel_R[view]` / `rel_t[view]`는 고정이다. 각 observation의 pose는
+  `view_w2c = rel[view] @ rig[ts]`로 만든다.
+- Cross-term zeroing: observation `(ts, view)`의 residual은 `rig_pose[ts]`에만
+  의존한다. 그래서 `ts_of_obs = obs_idx // n_views` 기준 block mask를 쓴다.
 
-Focal and translation parts of rel are kept for generality. For the Insta360
-X5 rig `rel_t == 0` (rotation-only).
+Focal과 `rel_t` 인자는 일반성을 위해 남겨둔다. 현재 zero-baseline virtual rig에서는
+`rel_t == 0`이다.
 """
 
 from utils import mtx2sixD, pts2px, sixD2mtx
@@ -25,18 +24,19 @@ from torch.func import jacfwd, vmap
 
 
 def project_rig(xyz, rig_R6D_t, rel_R, rel_t, f, centre):
-    """Single-observation projection: xyz in world, via rig[ts] composed with rel[view]."""
+    """Single-observation projection.
+
+    `R_view = R_rel @ R_rig`, `t_view = R_rel @ t_rig + t_rel`로 world point를
+    view camera 좌표로 보낸 뒤 pinhole projection한다.
+    """
     rig_R = sixD2mtx(rig_R6D_t[:6].reshape(3, 2))
     rig_t = rig_R6D_t[6:9]
     view_R = rel_R @ rig_R
     view_t = rel_R @ rig_t + rel_t
     xyz_local = view_R @ xyz + view_t
-    # Guard against z<=0 (point behind / at this view's camera). For a wide rig a
-    # point seeded in one view routinely projects behind another view; pts2px would
-    # then divide by ~0 -> inf/NaN. A single such value poisons the BA's robust
-    # threshold (0*inf=NaN in get_mask -> quantile NaN -> every obs masked -> the
-    # bundle becomes a no-op). Clamping z to a small positive depth keeps the
-    # projection finite & large so the (masked) obs is cleanly rejected instead.
+    # z<=0이면 point가 이 view 뒤쪽에 있다. Wide angular rig에서는 한 view에서 생긴
+    # point가 다른 view 뒤로 가는 일이 흔하고, 그대로 나누면 inf/NaN이 robust mask를
+    # 오염시킨다. 작은 양수로 clamp해 큰 residual로 만들고 mask에서 reject되게 한다.
     z = xyz_local[..., 2:3].clamp_min(1e-4)
     return f * xyz_local[..., :2] / z + centre
 
@@ -95,8 +95,8 @@ class MiniBARigInternal(nn.Module):
         )
         self.get_residual = vmap(vmap(get_residual))
 
-        # Precompute the cross-term mask (obs_idx j, rig_idx l): True when ts(j)==l.
-        # Shape compatible with the duv_dcam expansion in `optimize`.
+        # Cross-term mask: observation j는 `ts(j)`의 rig pose에만 의존한다.
+        # Shape은 `optimize` 안의 duv_dcam expansion과 맞춘다.
         j = torch.arange(self.n_obs).view(1, -1, 1, 1, 1)
         l = torch.arange(self.n_ts).view(1, 1, 1, -1, 1)
         # ts_of_obs[j] = j // n_views
@@ -122,9 +122,13 @@ class MiniBARigInternal(nn.Module):
         return xyz_e, rig_e, rel_R_e, rel_t_e, f_e, centre_e
 
     def get_mask(self, r_in, original_mask2):
+        r_view = r_in.view(self.npts, self.n_obs, 2)
+        finite_obs = torch.isfinite(r_view).all(dim=-1)
+        original_mask2 = original_mask2 & finite_obs
+        r_view = torch.nan_to_num(r_view, nan=0.0, posinf=0.0, neginf=0.0)
         if self.outlier_mad_scale > 0:
             err = torch.linalg.vector_norm(
-                r_in.view(-1, 2) * original_mask2.view(-1)[:, None],
+                r_view.reshape(-1, 2) * original_mask2.view(-1)[:, None],
                 dim=-1, keepdim=True,
             ).view(self.npts, self.n_obs)
             q = 1 - 0.5 * original_mask2.float().mean(0)
@@ -138,10 +142,13 @@ class MiniBARigInternal(nn.Module):
         return original_mask2.expand(-1, -1, 2).reshape(-1).float()
 
     def get_huber_weights(self, r):
+        r = torch.nan_to_num(r, nan=0.0, posinf=0.0, neginf=0.0)
         if self.huber_delta > 0:
             r_abs = r.abs()
             return torch.where(
-                r_abs <= self.huber_delta, 1, self.huber_delta / r_abs.sqrt()
+                r_abs <= self.huber_delta,
+                torch.ones_like(r_abs),
+                self.huber_delta / r_abs.clamp_min(1e-12).sqrt(),
             )
         return torch.ones_like(r)
 
@@ -163,16 +170,12 @@ class MiniBARigInternal(nn.Module):
                 *self.prepare_for_proj(xyz, rig_R6D_t, rel_R, rel_t, f, centre), uv
             )
             r_in = r_in.view(-1)
-            # jacobian_elements[poses] shape: (npts, n_obs, 2, 9) — local Jacobian wrt the
-            # rig pose *assigned to this observation's timestep*. We need to place it in
-            # the right n_ts-block and zero elsewhere (block-diagonal structure).
+            r_in = torch.nan_to_num(r_in, nan=0.0, posinf=0.0, neginf=0.0)
+            # jacobian_elements[poses]: observation이 속한 timestep의 rig pose에 대한
+            # local Jacobian. 이를 해당 timestep block에만 배치하고 나머지는 0으로 둔다.
             duv_drig = jacobian_elements[self.param2id["poses"]]  # (npts, n_obs, 2, 9)
-            # Block-diagonal placement: observation (ts, view)'s pose-Jacobian belongs
-            # only in rig-block ts. Broadcast the cross-mask against the *unsqueezed*
-            # local Jacobian and fill the off-blocks with a scalar zero, rather than
-            # materialising an n_ts-fold .repeat() AND a zeros_like (two full
-            # (.., n_ts, 9) tensors). The result is identical but transient memory is
-            # ~2.5x lower — which matters as n_views grows (9 -> 12 -> ...).
+            # cross-mask를 broadcast해 off-block을 scalar zero로 채운다. n_ts-fold repeat와
+            # zeros_like를 만들지 않아 transient memory를 크게 줄인다.
             duv_drig = torch.where(
                 self._cross_mask, duv_drig.unsqueeze(-2), duv_drig.new_zeros(())
             )  # (npts, n_obs, 2, n_ts, 9)
@@ -263,6 +266,7 @@ class MiniBARigInternal(nn.Module):
                 *self.prepare_for_proj(xyz_tmp, rig_R6D_t_tmp, rel_R, rel_t, f_tmp, centre),
                 uv,
             ).view(-1)
+            new_r = torch.nan_to_num(new_r, nan=0.0, posinf=0.0, neginf=0.0)
             weights = self.get_huber_weights(new_r) * mask
             new_r = new_r * weights
             success_mask = ((new_r ** 2).mean() < (r ** 2).mean()) * (f_tmp > 0)
@@ -279,6 +283,7 @@ class MiniBARigInternal(nn.Module):
         r = self.get_residual(
             *self.prepare_for_proj(xyz, rig_R6D_t_final, rel_R, rel_t, f, centre), uv
         ).view(-1)
+        r = torch.nan_to_num(r, nan=0.0, posinf=0.0, neginf=0.0)
         mask = self.get_mask(r, original_mask2)
         return rig_R6D, rig_t, f, xyz, r, initial_r, mask
 

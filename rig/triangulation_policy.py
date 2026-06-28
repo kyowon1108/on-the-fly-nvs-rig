@@ -1,7 +1,8 @@
-"""Lightweight rig triangulation partner policy.
+"""Rig triangulation partner policy.
 
-This module deliberately avoids importing scene/keyframe/feature code so the
-rig protocol checks can run on CPU without loading CUDA/CuPy-backed matchers.
+이 모듈은 scene/keyframe/feature code를 import하지 않는다. 그래서 rig protocol
+smoke test가 CUDA/CuPy-backed matcher를 로드하지 않고 CPU에서 partner policy만
+검증할 수 있다.
 """
 
 RIG_TRIANGULATION_AUDIT_KEYS = (

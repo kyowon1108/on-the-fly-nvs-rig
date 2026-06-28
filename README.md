@@ -1,50 +1,442 @@
-# On-the-fly Reconstruction for Large-Scale Novel View Synthesis from Unposed Images
-[Andreas Meuleman](https://ameuleman.github.io/), 
-[Ishaan Shah](https://ishaanshah.xyz/), 
-[Alexandre Lanvin](https://scholar.google.com/citations?hl=fr&user=e1s7mGsAAAAJ), 
-[Bernhard Kerbl](https://snosixtyboo.github.io/), 
-[George Drettakis](https://www-sop.inria.fr/members/George.Drettakis/)
+# On-the-Fly NVS Rig Fork
 
-### [Project page](https://repo-sam.inria.fr/nerphys/on-the-fly-nvs/) | [Paper](https://repo-sam.inria.fr/nerphys/on-the-fly-nvs/onthefly_nvs.pdf) | [Data](https://repo-sam.inria.fr/nerphys/on-the-fly-nvs/datasets/)
+GraphDeco/Inria의 **On-the-Fly NVS**를 기반으로,
+단일 360도 EQR 이미지를 여러 개의 virtual pinhole view로 나누어
+rotation-only zero-baseline rig로 처리함.
 
-<img src="assets/teaser.svg" width="100%">
+원본 프로젝트:
 
-**Table of contents**: [Setup](#setup) | [Data Guidelines](#data-guidelines) | [Optimization](#optimization) | [Evaluation](#evaluation) | [Viewers](#interactive-viewers) | [Capture Guidelines](#capture-guidelines) | [Video Stream](#video-stream) | [Acknowledgments](#acknowledgments)
+- Paper / project: <https://repo-sam.inria.fr/nerphys/on-the-fly-nvs/>
+- Upstream code: <https://github.com/graphdeco-inria/on-the-fly-nvs>
 
-We propose a fast, on-the-fly 3D Gaussian Splatting method that jointly estimates poses and reconstructs scenes. Through fast pose initialization, direct primitive sampling, and scalable clustering and merging, it efficiently handles diverse ordered image sequences of arbitrary length.
+### 목표
 
-<!-- Institutions logos -->
-<div align="center">
-  <a href="https://www.inria.fr/">
-    <img width="25%" src="assets/inria_logo.svg" hspace="2%">
-  </a>
-  <a href="https://univ-cotedazur.eu/">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" width="28%" hspace="2%" srcset="assets/uca_logo_dark.svg">
-      <img width="28%" hspace="2%" src="assets/uca_logo.svg">
-    </picture>
-  </a>
-  <a href="https://www.tuwien.at/en/">
-    <img width="7%" hspace="2%" src="assets/tuwien_logo.svg">
-  </a>
-</div>
-<br>
-<a href="https://team.inria.fr/graphdeco/">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" width="23.5%" hspace="2%" srcset="assets/graphdeco_logo_dark.svg">
-    <img width="23.5%" hspace="2%" src="assets/graphdeco_logo.svg">
-  </picture>
-</a>
-<a href="https://project.inria.fr/nerphys/">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" width="16.5%" hspace="2%" srcset="assets/erc_logo_dark.svg">
-    <img width="16.5%" hspace="2%" src="assets/erc_logo.svg">
-  </picture>
-</a>
+> 360 panorama는 한 번의 physical capture에서 넓은 angular coverage를 주지만,
+> same-timestep stereo baseline은 0임. 이 조건에서 online pose-coupled
+> Gaussian reconstruction이 temporal parallax, shared-pose refinement,
+> depth prior, densification에 얼마나 의존하는지 평가함.
+
+## 현재 환경
+
+개발/실험 기준 환경은 다음과 같음.
+
+| 항목 | 값 |
+| --- | --- |
+| OS | WSL2 / Ubuntu 22.04 LTS |
+| GPU | NVIDIA CUDA GPU (RTX 4060Ti 16GB) |
+| Conda env | `onthefly_nvs` |
+
+## 설치
+
+처음 clone한 환경에서는 submodule과 CUDA extension이 필요함.
+zip snapshot에는 큰 submodule 산출물이 빠질 수 있으므로, 학습 환경에서는
+submodule을 다시 준비해야 함.
+
+```bash
+git submodule update --init --recursive
+
+conda create -n onthefly_nvs python=3.12 -y
+conda activate onthefly_nvs
+
+pip install torch torchvision xformers --index-url https://download.pytorch.org/whl/cu128
+pip install cupy-cuda12x
+pip install -r requirements.txt
+```
+
+## 데이터 구조
+
+이 repo의 rig loader는 이미 EQR에서 추출된 pinhole rig dataset을 읽음.
+원본 EQR, 변환된 pinhole rig dataset, 외부 baseline 결과는 repo 밖의
+작업 폴더에서 관리하는 것을 권장함.
+
+입력 scene은 다음 형태를 기대함.
+
+```text
+<scene>/
+  extraction_meta.json        # optional, init_focal 등을 자동 로드
+  images/
+    E+0_A000/
+      frame_000000.png
+      frame_000001.png
+      ...
+    E+0_A090/
+      frame_000000.png
+      frame_000001.png
+      ...
+    ...
+  masks/                      # optional
+    E+0_A000/
+      frame_000000.png
+      ...
+  gt_centers.json             # optional, OB3D ATE 평가용
+```
+
+## EQR to pinhole 예시
+
+EQR 원본을 12-view pinhole rig로 자르는 예시 파일은 repo 안에 같이 둠.
+GitHub에서 구조를 바로 볼 수 있게 아래 3개를 snapshot으로 포함함.
+
+| 파일 | 용도 |
+| --- | --- |
+| `examples/panoramic_rig/eqr_to_pinhole.py` | EQR image/video를 `images/<view>/frame_xxxxxx.png` 구조로 추출 |
+| `examples/panoramic_rig/rig12_panosfm.json` | OTF-Rig와 변환기용 12-view Blender-style rig |
+| `examples/panoramic_rig/colmap_rig_panosfm.json` | COLMAP `rig_configurator`용 panorama-SfM style rig |
+
+단일 EQR image 변환 예시는 다음과 같음.
+
+```bash
+export OTFRIG_ROOT=/path/to/otfrig
+
+python examples/panoramic_rig/eqr_to_pinhole.py \
+  --eqr_image /path/to/00000_rgb.png \
+  --out_dir "$OTFRIG_ROOT/pinhole_rig/example_scene" \
+  --rig_config examples/panoramic_rig/rig12_panosfm.json \
+  --ref_view E+0_A000 \
+  --fov 90 \
+  --size 960 \
+  --write_masks \
+  --device cuda
+```
+
+video에서 stride를 두고 추출하는 예시는 다음과 같음.
+
+```bash
+export OTFRIG_ROOT=/path/to/otfrig
+
+python examples/panoramic_rig/eqr_to_pinhole.py \
+  --video /path/to/input_eqr.mp4 \
+  --out_dir "$OTFRIG_ROOT/pinhole_rig/example_video" \
+  --rig_config examples/panoramic_rig/rig12_panosfm.json \
+  --ref_view E+0_A000 \
+  --fov 90 \
+  --size 960 \
+  --stride 2 \
+  --frame_limit 100 \
+  --write_masks \
+  --device cuda
+```
+
+이 변환기는 `extraction_meta.json`도 같이 저장함.
+OTF 학습에서는 이 metadata에서 focal을 자동으로 읽을 수 있음.
+예를 들어 FOV 90도, 960x960이면 \(f=480\)이고,
+400x400 prepared OB3D rig라면 \(f=200\)임.
+
+12-view layout은 다음 규약을 사용함.
+
+| ring | views |
+| --- | --- |
+| `E+35` | `A045`, `A135`, `A225`, `A315` |
+| `E+0` | `A000`, `A090`, `A180`, `A270` |
+| `E-35` | `A000`, `A090`, `A180`, `A270` |
+
+`rig12_panosfm.json`의 형태는 다음과 같음.
+중요한 점은 모든 view의 `location`이 `[0, 0, 0]`이라는 것임.
+최종 OTF loader에서도 relative translation은 0으로 강제됨.
+
+```json
+[
+  {
+    "name": "Pano",
+    "cameras": [
+      {
+        "name": "E+35_A045",
+        "location": [0.0, 0.0, 0.0],
+        "rotation": [0.4266000929, 0.8194911539, -0.3394443502, -0.1767035442]
+      },
+      {
+        "name": "E+0_A000",
+        "location": [0.0, 0.0, 0.0],
+        "rotation": [-0.5, -0.5, 0.5, 0.5]
+      },
+      {
+        "name": "E-35_A000",
+        "location": [0.0, 0.0, 0.0],
+        "rotation": [0.6272113751, 0.3265055756, -0.3265055756, -0.6272113751]
+      }
+    ]
+  }
+]
+```
+
+위 snippet은 전체 12개 중 일부만 보인 것임.
+전체 view list는 `examples/panoramic_rig/rig12_panosfm.json`을 기준으로 함.
+
+COLMAP baseline은 같은 image folder를 쓰지만 config 형식이 다름.
+`colmap_rig_panosfm.json`은 `image_prefix`, `PINHOLE` intrinsics,
+`cam_from_rig_rotation`, `cam_from_rig_translation`을 담음.
+여기서도 translation은 모두 0이어야 함.
+
+```json
+{
+  "image_prefix": "E+35_A045/",
+  "camera_model_name": "PINHOLE",
+  "camera_params": [200.0, 200.0, 200.0, 200.0],
+  "cam_from_rig_translation": [0.0, 0.0, 0.0]
+}
+```
+
+## 용어 정리
+
+### 입력/데이터 단위
+
+| 이름 | 의미 | 사용처 |
+| --- | --- | --- |
+| EQR | 360도 이미지를 위도/경도 좌표로 펼친 이미지임 | 원본 panorama 입력 |
+| virtual pinhole view | EQR에서 특정 방향만 잘라 만든 일반 pinhole camera 이미지임 | OTF 입력 view |
+| timestep | 하나의 physical capture 시점임. EQR 한 장에 해당함 | train/test split 단위 |
+| packet | 같은 timestep에서 나온 N개 virtual view 묶음임 | rig streaming 단위 |
+| `source_ts` | 파일명에서 파싱한 원본 EQR frame index | split, ATE, report |
+| `stream_idx` | loader가 정렬한 online 입력 순서 | streaming loop |
+| `ts_idx` / rig slot | 등록된 shared rig pose parameter index | `rig_R6D`, `rig_t` indexing |
+| keyframe | OTF 내부에서 pose, feature, depth, image cache를 들고 있는 view-level 상태임 | `scene_model.keyframes` |
+
+즉 `frame_000010.png`는 `source_ts=10`이어야 함.
+sorted rank를 claim split이나 ATE에 쓰면 안 됨.
+
+### Rig geometry
+
+| 이름 | 의미 | 코드/수식에서의 역할 |
+| --- | --- | --- |
+| rig | 여러 camera/view를 하나의 묶음으로 보는 구조임 | 한 timestep의 N개 view를 같이 처리함 |
+| zero-baseline rig | 같은 timestep의 모든 view가 같은 optical center를 공유하는 rig임 | same-timestep depth를 만들 수 없음 |
+| ref view | packet 안에서 기준으로 삼는 view임 | 보통 `E+0_A000` |
+| relative pose | ref view 기준으로 각 view가 어느 방향을 보는지 나타내는 고정 회전임 | `relative_Rt[view]` |
+| shared rig pose | 한 timestep 전체가 공유하는 하나의 SE(3) pose임 | `rig_R6D[ts_idx]`, `rig_t[ts_idx]` |
+| view pose | fixed relative pose와 shared rig pose를 합성한 각 view pose임 | `view_w2c = relative_Rt @ rig_w2c` |
+| optical center | camera ray들이 출발하는 3D 위치임 | zero-baseline 여부 확인 |
+| baseline | 두 optical center 사이 거리임 | depth triangulation 가능성 결정 |
+| parallax | camera 위치 변화 때문에 같은 물체가 이미지에서 다르게 보이는 정도임 | depth를 만드는 핵심 신호 |
+| temporal parallax | 서로 다른 timestep 사이의 이동으로 생기는 parallax임 | 이 rig의 주된 depth source |
+
+### Reconstruction
+
+| 이름 | 의미 | 왜 중요한가 |
+| --- | --- | --- |
+| triangulation | 서로 다른 위치에서 본 feature match로 3D point를 구하는 과정임 | 같은 timestep에서는 금지해야 함 |
+| same-timestep leakage | 같은 timestep view가 triangulation/MVS partner로 섞이는 버그임 | zero-baseline claim을 깨는 문제임 |
+| depth prior | 이미지에서 예상 깊이 순서나 형태를 주는 보조 신호임 | texture/low-parallax 구간에서 도움 가능 |
+| guided MVS | 기존 3D/feature/depth 신호를 이용해 새 point depth를 찾는 과정임 | Gaussian spawn 후보 생성에 관여함 |
+| Gaussian spawn | 새 3D Gaussian을 scene에 추가하는 단계임 | reconstruction density를 늘림 |
+| densification | 부족한 영역을 채우기 위해 Gaussian을 늘리는 과정임 | NVS 품질에 직접 영향 |
+| photometric optimization | render와 target image 차이를 줄이도록 pose/Gaussian을 최적화하는 과정임 | shared rig pose refinement의 핵심 |
+
+### Evaluation
+
+| 이름 | 의미 | 주의점 |
+| --- | --- | --- |
+| pose-assisted online eval | test/tracking frame도 pose tracking stream에는 남기는 평가 방식임 | Gaussian 학습/metric과 분리해야 함 |
+| train timestep | Gaussian spawn과 photometric loss에 쓰는 timestep임 | `rig_eval_split == "train"` |
+| test timestep | 최종 NVS metric에 쓰는 held-out timestep임 | `rig_eval_split == "test"` |
+| tracking-only timestep | pose tracking에는 쓰지만 train/test metric에는 쓰지 않는 timestep임 | diagnostic 성격임 |
+| claim metric | 논문 표에 올릴 수 있는 metric임 | test split만 사용해야 함 |
+| diagnostic metric | 디버깅용 metric임 | headline number로 쓰면 안 됨 |
+| ATE | 추정 trajectory와 GT trajectory의 위치 오차임 | Sim(3) 정렬 뒤 계산 |
+| registration recall | 기대 timestep 중 pose 등록에 성공한 비율임 | missing timestep을 숨기면 안 됨 |
+| center spread | 같은 timestep view center들이 얼마나 벌어졌는지임 | zero-baseline이면 거의 0이어야 함 |
+
+## Rig 수식
+
+각 EQR timestep \(t\)에서 \(N\)개의 virtual pinhole view
+\(I_{t,v}\)를 사용함. 모든 view는 같은 optical center를 공유하고,
+view마다 고정된 relative rotation만 다름.
+
+world-to-rig pose:
+
+$$
+T_t^{rig} =
+\begin{bmatrix}
+R_t & t_t \\
+0 & 1
+\end{bmatrix}
+$$
+
+view별 fixed relative transform:
+
+$$
+T_v^{rel} =
+\begin{bmatrix}
+R_v^{rel} & 0 \\
+0 & 1
+\end{bmatrix}
+$$
+
+view pose는 다음처럼 합성함.
+
+$$
+T_{t,v}^{cam} = T_v^{rel} T_t^{rig}
+$$
+
+따라서
+
+$$
+R_{t,v} = R_v^{rel} R_t,\quad
+t_{t,v} = R_v^{rel} t_t
+$$
+
+camera center는
+
+$$
+C_{t,v} = -R_{t,v}^{T} t_{t,v}
+= -(R_v^{rel}R_t)^T(R_v^{rel}t_t)
+= -R_t^T t_t
+$$
+
+즉 같은 timestep의 모든 view center가 동일함.
+same-timestep view pair는 baseline이 0이라 triangulation depth를 만들 수 없음.
+depth-bearing geometry는 temporal parallax, depth prior, Gaussian densification에서 나옴.
+
+## 평가 정책
+
+이 fork의 OB3D 논문용 평가는 **timestep packet split**을 사용함.
+한 EQR timestep에 속한 모든 virtual view가 train 또는 test packet으로 같이 움직임.
+
+중요한 구분:
+
+| 항목 | 정책 |
+| --- | --- |
+| pose tracking | online pose-assisted 평가임. bootstrap/tracking은 등록된 frame을 pose 추정에 사용할 수 있음 |
+| Gaussian spawn | `rig_eval_split == "train"`만 사용 |
+| photometric optimization | `rig_eval_split == "train"`만 사용 |
+| triangulation/MVS partner | train + cross-`source_ts` partner만 허용 |
+| test NVS metric | `rig_eval_split == "test"`만 사용 |
+| `rig_holdout_view` | diagnostic 전용. OB3D 논문용 metric으로 쓰지 않음 |
+
+"test frame을 절대 사용하지 않음"이라고 쓰면 틀림.
+정확한 표현은 다음임.
+
+> test timestep은 online pose tracking stream에는 남아 있지만,
+> Gaussian spawn, radiance optimization, claim metric에서는 분리됨.
+
+## 실행 예시
+
+### 1. Preflight
+
+```bash
+export OTFRIG_ROOT=/path/to/otfrig
+
+python scripts/preflight_ob3d_rig_scene.py \
+  --scene "$OTFRIG_ROOT/pinhole_rig/ob3d_rig/classroom_100" \
+  --rig-config examples/panoramic_rig/rig12_panosfm.json \
+  --ref-view E+0_A000 \
+  --train-timesteps-file splits/ob3d/egocentric/classroom/train.txt \
+  --test-timesteps-file splits/ob3d/egocentric/classroom/test.txt
+```
+
+### 2. Train
+
+`extraction_meta.json`에 focal이 있으면 `--init_focal`은 자동 로드됨.
+없으면 400x400, 90도 FOV 기준으로 `--init_focal 200`을 명시함.
+
+```bash
+python train.py -s "$OTFRIG_ROOT/pinhole_rig/ob3d_rig/classroom_100" \
+  --use_rig \
+  --rig_config examples/panoramic_rig/rig12_panosfm.json \
+  --ref_view E+0_A000 \
+  --fix_focal \
+  --downsampling 1 \
+  --num_iterations 270 \
+  --seed 0 \
+  --viewer_mode none \
+  --rig_train_timesteps_file splits/ob3d/egocentric/classroom/train.txt \
+  --rig_test_timesteps_file splits/ob3d/egocentric/classroom/test.txt \
+  -m results/example/classroom_seed0
+```
+
+### 3. ATE
+
+```bash
+python scripts/eval_ob3d_rig_ate.py \
+  --run results/example/classroom_seed0 \
+  --gt-centers "$OTFRIG_ROOT/pinhole_rig/ob3d_rig/classroom_100/gt_centers.json" \
+  --fail-on-missing
+```
+
+### 4. Protocol artifact check
+
+```bash
+python scripts/check_rig_protocol_artifacts.py \
+  --run results/example/classroom_seed0 \
+  --expected-num-views 12 \
+  --fail-on-missing
+```
+
+통과 조건은 대략 다음임.
+
+```text
+missing_timesteps_all == []
+missing_timesteps_test == []
+views_per_timestep_min == 12
+views_per_timestep_max == 12
+same_ts_spread_max_m < 1e-6
+triangulation_partner_count_same_ts == 0
+triangulation_partner_count_test == 0
+triangulation_partner_count_tracking == 0
+spawn_count_test == 0
+spawn_count_tracking == 0
+```
+
+## 주요 CLI
+
+| 인자 | 의미 |
+| --- | --- |
+| `--use_rig` | rig-aware loader와 shared rig pose path 활성화 |
+| `--rig_config` | virtual rig JSON. view별 `cam_from_rig_rotation` 사용 |
+| `--ref_view` | timestep packet에서 기준 view. OB3D rig는 보통 `E+0_A000` |
+| `--rig_train_timesteps_file` | train `source_ts` 목록 |
+| `--rig_test_timesteps_file` | test `source_ts` 목록 |
+| `--rig_holdout_view` | view holdout diagnostic. OB3D 논문용 metric 아님 |
+| `--freeze_rig_poses` | photometric shared-pose update를 끄는 ablation |
+| `--rig_min_success_views` | 한 timestep pose 승인에 필요한 성공 view 수. 기본 2 |
+| `--rig_huber_trans` | per-view PnP candidate fusion의 translation robust threshold |
+| `--rig_bootstrap_outlier_dist` | bootstrap sparse point distance prune threshold |
+| `--masks_dir` | optional mask directory |
+| `--init_focal`, `--init_fov`, `--fix_focal` | focal 초기화 및 고정 |
+
+rig mode에서 금지되는 upstream option:
+
+| 인자 | 이유 |
+| --- | --- |
+| `--enable_reboot` | single-camera reboot이며 rig packet state reset과 맞지 않음 |
+| `--test_hold` | image-stride holdout이라 같은 timestep view leakage를 만들 수 있음 |
+| `--use_colmap_poses` | per-image pose import라 shared rig pose 규약과 충돌함 |
+
+## 코드 맵
+
+| 파일 | 역할 |
+| --- | --- |
+| `dataloaders/rig_image_dataset.py` | N-view packet loader, `source_ts` parsing, timestep split, focal/mask loading |
+| `rig/rig_loader.py` | rig JSON 로드, reference view 정렬, `rel_t = 0` 강제 |
+| `rig/rig_pnp.py` | view별 PnP candidate를 shared rig pose로 합침 |
+| `rig/triangulation_policy.py` | train + cross-timestep triangulation partner만 허용 |
+| `poses/pose_initializer.py` | rig bootstrap / incremental pose initialization |
+| `poses/mini_ba_rig.py` | shared rig pose MiniBA |
+| `scene/keyframe.py` | `view_w2c = relative_Rt @ rig_w2c` 합성, keyframe state 관리 |
+| `scene/scene_model.py` | shared rig pose parameter, Gaussian spawn, leakage audit, completeness metadata |
+| `train.py` | timestep packet streaming, train/test/tracking split, post-hoc render eval |
+| `scripts/eval_ob3d_rig_ate.py` | OB3D GT center 기반 Sim(3) ATE |
+| `scripts/check_rig_protocol_artifacts.py` | rig protocol artifact sanity check |
+| `scripts/smoke_rig_protocol_*.py` | split/triangulation/spawn/timestep/completeness smoke test |
+
+## 출력 파일
+
+학습 run의 핵심 산출물은 다음임.
+
+| 파일 | 용도 |
+| --- | --- |
+| `metadata.json` | 저장된 keyframe, rig pose, policy, registered keyframe만 반영한 COLMAP export |
+| `render_eval/metrics_claim_test.json` | 논문용 held-out timestep metric |
+| `render_eval/metrics_diagnostic_all.json` | 전체 frame diagnostic. headline metric으로 쓰지 않음 |
+| `render_eval/metrics_diagnostic_tracking.json` | tracking-only diagnostic |
+| `render_eval/split_metrics.json` | split별 metric과 policy 요약 |
+| `render_eval/rig_completeness.json` | expected/registered/failed/missing timestep |
+| `render_eval/rig_leakage_audit.json` | same-ts/test/tracking leakage counter와 finite reject 통계 |
 
 ## Citation
-If you find this code useful in a publication, please use the following citation:
-```
+
+이 fork는 원본 On-the-Fly NVS 위에 구현됨.
+원본 코드를 사용하는 경우 아래 citation을 유지해야 함.
+
+```bibtex
 @article{meuleman2025onthefly,
   title={On-the-fly Reconstruction for Large-Scale Novel View Synthesis from Unposed Images},
   author={Meuleman, Andreas and Shah, Ishaan and Lanvin, Alexandre and Kerbl, Bernhard and Drettakis, George},
@@ -54,357 +446,3 @@ If you find this code useful in a publication, please use the following citation
   year={2025}
 }
 ```
-
-## Setup 
-Tested on Ubuntu 22.04 and Windows 11 with PyTorch 2.7.0, and CUDA 11.8 and 12.8.
-<br>
-Create the environment:
-```bash
-git clone --recursive https://github.com/graphdeco-inria/on-the-fly-nvs.git
-cd on-the-fly-nvs
-conda create -n onthefly_nvs python=3.12 -y
-conda activate onthefly_nvs
-```
-Default setup with CUDA 12.8 (check your compute platform with `nvcc --version`):
-```pwsh
-# Windows Only
-SET DISTUTILS_USE_SDK=1 # (If you use cmd.exe)
-$env:DISTUTILS_USE_SDK=1 # (If you use PowerShell)
-```
-```bash
-# Get the versions corresponding to your compute platform at https://pytorch.org/
-pip install torch torchvision xformers --index-url https://download.pytorch.org/whl/cu128
-pip install cupy-cuda12x
-pip install -r requirements.txt
-```
-
-<details>
-<summary>Setup with CUDA 11.8</summary>
-Note that <code>xformers</code> will not be installed with CUDA 11.8 because it requires a version of PyTorch that is incompatible with our codebase.
-<pre><code>pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
-pip install cupy-cuda11x
-pip install -r requirements.txt
-</code></pre>
-</details>
-
-<details>
-<summary>Installing CUDA within a Conda Environment</summary>
-If <code>nvcc --version</code> returns an error, you can install CUDA within your Conda environment. 
-After activating your environment and before installing PyTorch, run:
-<pre><code>conda install nvidia/label/cuda-12.8.0::cuda-nvcc
-</code></pre>
-Make sure to replace <code>12.8.0</code> with a version supported by your driver (check maximum version with <code>nvidia-smi</code>). A list of the available versions can be found <a href="https://anaconda.org/nvidia/cuda-nvcc">here</a>.
-</details>
-
-<details>
-<summary>Specifying Environment Path</summary>
-You can specify paths for Conda to save space on your system drive:
-<pre><code>conda config --add pkgs_dirs &lt;pkg_path&gt;
-conda create python=3.12 -y --prefix &lt;env_path&gt;/onthefly_nvs
-conda activate &lt;env_path&gt;/onthefly_nvs
-</code></pre>
-Where <code>&lt;pkg_path&gt;</code> is the desired package download location and <code>&lt;env_path&gt;/onthefly_nvs</code> is the desired environment location.
-</details>
-
-## Data Guidelines
-> Please note that our method **is not a drop-in replacement for COLMAP + 3DGS, as it does not reorder images**. We require sequential capture that implies several constraints on the kind of data that can be handled. Please follow the **[Capture Guidelines](#capture-guidelines) for best results on your own data.**
-
-The dataloader will look for images in `${SOURCE_PATH}/images` by default. The images should be ordered alphabetically and have a `.png`, `.jpg` or `.jpeg` extension.
-It will also optionally look for [COLMAP files](https://colmap.github.io/format.html) in `${SOURCE_PATH}/sparse/0` for ground truth poses visualization.
-
-To download the datasets used in Table 1 of the paper, run:
-```bash
-# All datasets will be downloaded in data/
-python scripts/download_datasets.py --out_dir data/
-
-# Or download a specific dataset
-python scripts/download_datasets.py --out_dir data/ --datasets MipNeRF360 # or TUM, or StaticHikes
-```
-
-For best results, we recommend using a high-quality camera and providing still photographs to the method. We provide an experimental prototype for reconstruction from a [Video Stream](#video-stream) that will not provide the same level of quality.
-
-## Optimization
-The following command runs the reconstruction and saves the model. If `-m` is not provided, the model will be saved in `results/xxxxxx/`.
-```bash
-python train.py -s ${SOURCE_PATH} -m ${MODEL_PATH}
-```
-This command uses *all* input images, which provides the best result. Metrics in the paper are computed with evaluation protocol below (see [Evaluation](#evaluation)). See also the [Interactive Viewers](#interactive-viewers) section below for direct feedback on your training.
-<br>
-Example basic training command (see [Data Guidelines](#data-guidelines) for downloading the dataset):
-```bash
-python train.py -s data/MipNeRF360/garden -m results/MipNeRF360/garden
-```
-<details>
-<summary><span style="font-weight: bold;">Main Command Line Arguments for train.py</span></summary>
-
-  #### --source_path / -s
-  Path to the data folder (should have sparse/0/ if using COLMAP or evaluating poses).
-  #### --model_path / -m
-  Directory to store the renders from test view and checkpoints after training. If not set, will be set to `results/xxxxxx`.
-  #### --images_dir / -i
-  `source_path/images_dir/` is the path to the images (with extensions jpg, png or jpeg). If not set, will use source_path/images.
-  #### --masks_dir
-  If set, `source_path/masks_dir/` is the path to optional masks to apply to the images before computing the loss (the format expected is png).
-  #### --viewer_mode
-  Running mode for the viewer, choices are [`local`, `server`, `web`, `none`], `none` by default. See [Interactive Viewers](#interactive-viewers) for more details.
-  #### --ip
-  IP address of the viewer client, if using server viewer_mode, `0.0.0.0` by default.
-  #### --port
-  Port of the viewer client, if using "server" `viewer_mode`, `6009` by default.
-  #### --downsampling
-  Downsampling ratio for input images.
-  #### --save_every
-  Frequency of exporting renders w.r.t input frames.
-  #### --save_at_finetune_epoch
-  Enable finetuning after the initial on-the-fly reconstruction and save the scene at the end of the specified epochs when fine-tuning.
-  #### --eval_poses
-  Compare poses to COLMAP.
-  #### --use_colmap_poses
-  Load COLMAP data for pose and intrinsics initialization.
-  #### --test_hold
-  Holdout for test set, will exclude every test_hold image from the Gaussian optimization and use them for testing. The test frames will still be used for training the pose. If set to -1, no keyframes will be excluded from training.
-  #### --test_frequency
-  Test and get metrics every test_frequency keyframes.
-  #### --display_runtimes
-  Display runtimes for each step in the tqdm bar.
-
-</details>
-
->Run `python train.py -h` for a complete list of available options.
-
-## Evaluation
-The following command runs the reconstruction while excluding every `${TEST_HOLD}`-th image from the Gaussian optimization. It evaluates and saves the test images to `${MODEL_PATH}/test_images` at the end of training.
-```bash
-python train.py -s ${SOURCE_PATH} -m ${MODEL_PATH} --test_hold ${TEST_HOLD}
-```
-Example (see [Data Guidelines](#data-guidelines) for downloading the dataset):
-```bash
-python train.py -s data/MipNeRF360/garden -m results/MipNeRF360/garden --test_hold 8 --test_frequency 20
-```
-
-To evaluate all scenes reported in Table 1 of the paper, run:
-```bash
-python scripts/train_eval_all.py --base_dir data/ --base_out_dir results/
-```
-
-## Interactive Viewers
-The viewers allow navigation of the scene during and after optimization, and visualization of both optimized and ground truth poses. `W, A, S, D, Q, E` control camera translation and `I, K, J, L, U, O` control rotation. We release the base viewer components in a [separate repository](https://github.com/graphdeco-inria/graphdecoviewer) so that they can be used in other projects. If you find it useful, please consider citing it.
-
-
-https://github.com/user-attachments/assets/a94130f0-8f93-46e2-844b-f4b6fcae8a0b
-
-
-### Live Optimization Viewer
-To open an interactive viewer window during the optimization process, use the following command:
-
-```bash
-python train.py -s ${SOURCE_PATH} --viewer_mode local
-```
-Example (see [Data Guidelines](#data-guidelines) for downloading the dataset):
-```bash
-python train.py -s data/MipNeRF360/garden --viewer_mode local
-```
-
-This viewer operates concurrently with the optimization process. You can enable throttling by clicking the `Throttling` checkbox and adjust the `Max FPS` slider in the viewer to balance resource allocation between the viewer and the optimization task. Enabling the live optimization viewer will keep the optimization process running after the training is complete.
-
-### Visualizing a Reconstructed Scene
-After [optimization](#optimization), you can visualize the reconstructed scene using the following command:
-```bash
-python gaussianviewer.py local ${MODEL_PATH}
-```
-Example:
-```bash
-python gaussianviewer.py local results/MipNeRF360/garden
-```
-
-### Network Viewer
-
-The network viewer allows you to visualize a scene and monitor the optimization process from a different machine. The client waits for the server program to connect and stream rendered images.
-
-To run the client, use the following command:
-```bash
-python gaussianviewer.py client
-```
-On the server side, run one of the following commands:
-```bash
-# live optimization visualization
-python train.py -s ${SOURCE_PATH} --viewer_mode server
-
-# or
-# visualize a reconstructed scene
-python gaussianviewer.py server ${MODEL_PATH}
-```
-
-When using different machines, ensure the specified port is forwarded or set `--ip` and `--port` appropriately for both the client and server.
-
-<details>
-<summary><span style="font-weight: bold;">Lightweight Remote Viewer Environment</span></summary>
-The remote viewer has fewer dependencies, making it convenient to run on a different machine than the one performing the optimization. Since rendering occurs on the host machine, the client machine does not need a CUDA-compatible GPU.
-
-To set up the remote viewer on a different machine, follow these steps:
-```bash
-conda create -n onthefly_nvs_remoteviewer python=3.12 -y
-conda activate onthefly_nvs_remoteviewer
-pip install submodules/graphdecoviewer
-```
-</details>
-
-**Note**: On the first run, the settings window might be hidden behind the `Point View` window. Move the window to reveal it. The updated layout will be stored when the viewer is closed for future runs.
-
-## Render a Video from an Optimized Scene
-The following command renders the reconstruction saved in `${MODEL_PATH}` along the path `${RENDER_PATH}` and exports the frames and video in `${VIDEO_DIR}`. The camera trajectory files in `${RENDER_PATH}` must follow the [COLMAP format](https://colmap.github.io/format.html) (`images.[bin/txt]` and `cameras.[bin/txt]`).
-```bash
-python scripts/render_path.py -m ${MODEL_PATH} --render_path ${RENDER_PATH} --out_dir ${VIDEO_DIR}
-```
-Here, we render the reconstruction of the garden scene along the optimized poses (that `train.py` saves in `${MODEL_PATH}/colmap`):
-```bash
-python scripts/render_path.py -m results/MipNeRF360/garden --render_path results/MipNeRF360/garden/colmap --out_dir results/MipNeRF360/garden/video
-```
-
-<details>
-<summary><span style="font-weight: bold;">Aligning Render Path</span></summary>
-The poses in <code>${RENDER_PATH}</code> may be in a different coordinate system than the optimized scene, so we provide an optional argument <code>--alignment_path</code> to align it to the scene. 
-Specifically, we find a transformation between the cameras in <code>&lt;alignment_path&gt;</code> and the scene keyframes, and apply this transformation to the cameras in <code>${RENDER_PATH}</code>. 
-Note that the image names corresponding to the poses in <code>&lt;alignment_path&gt;</code> should match the image names used to optimize the scene.
-This is useful for rendering a camera path that has been captured on a different viewer and method (e.g. 3DGS and SIBR) and ensure the rendered video paths match.
-</details>
-
-## Capture Guidelines
-As mentioned above, our method *is not a drop-in replacement for COLMAP and 3DGS*. In particular, for efficiency and to allow live feedback, we do not perform exhaustive matching or reorder the input images like SfM approaches such as COLMAP. Many standard datasets used in previous work thus *cannot be handled* by our approach (e.g., Zip-NeRF scenes, or most MipNeRF360 scenes such as bicycle).
-
-It is important to carefully follow the guidelines below for the method to work and to achieve good results:
-* **Ordered Sequences**: Capture images sequentially with sufficient overlap. Ideally, consecutive frames should share >2/3rd of their content. This typically involves walking slowly around a scene and taking pictures sequentially. This works very well for outdoors scenes where one naturally moves forward; for indoors scenes, restrictions in space often lead to errors. Please see below on what to avoid. 
-Again, unordered datasets (e.g., Zip-NeRF-style, many DeepBlending scenes, etc.) are not supported.
-* **Translation**: Ensure sufficient translation between consecutive frames for accurate triangulation. 
-Avoid rotation without translation: taking a step sideways between pictures when turning helps maintain a sufficient baseline, especially indoors. 
-This is critical for bootstrapping, as an insufficient translation can lead to incorrect focal length estimation, but is also important throughout capture.
-* **Resolution**: We found that the matcher performs best within the 1-2MP range.
-* **Pinhole Camera Model**: We optimize only for focal length, so ensure your images follow a pinhole projection with centered principal point (no fisheye/distortion).
-* **No Loop Closure**: Drift compensation is not performed when the trajectory revisits a previously reconstructed region. This can cause misalignments due to accumulated pose errors, especially after registering a long sequence between the start and end of the loop. For small loops (e.g., the Truck scene from the T and T dataset) our method works well.
-
-### Example Failure Cases:
-<table>
-  <tr>
-    <td width="40%" valign="top">
-      <picture>
-        <source width="100%" media="(prefers-color-scheme: dark)" srcset="assets/ordered_dark.svg">
-        <img width="100%" src="assets/ordered.svg">
-     </picture>
-      <sup>The reconstruction fails when the sequence is not ordered or if there is not enough overlap between consecutive frames.</sup>
-    </td> 
-    <td width="40%" valign="top">
-      <picture>
-        <source width="100%" media="(prefers-color-scheme: dark)" srcset="assets/baseline_dark.svg">
-        <img width="100%" src="assets/baseline.svg">
-     </picture>
-      <sup>Bootstrapping fails when there is high rotation but small translation.</sup>
-    </td>
-    <td width="25%" valign="top">
-      <img src="assets/loop.jpg" style="width: 100%"/>
-      <sup>Drift is not corrected when the trajectory loops (estimated poses in white, ground truth in red).</sup>
-    </td>
-  </tr>
-</table>
-
-## Video Stream
-We provide a proof-of-concept setup for reconstructing a scene from a video stream with live feedback. 
-Due to lower image quality and limited control over capture conditions, reconstructions may be less satisfactory than with images carefully captured following the guidelines above using a high-quality camera. 
-Reconstruction quality also depends heavily on camera quality and network speed, with poor connectivity causing motion blur and compression artifacts.
-
-### 1. Setting up a Stream
-To set up a stream from a phone, we found [IP Webcam (For Android)](https://play.google.com/store/apps/details?id=com.pas.webcam) and [IP Camera Lite (For iOS / iPadOS)](https://apps.apple.com/us/app/ip-camera-lite/id1013455241) to be a simple solution. We found that the method works best with wide angle camera at 1080p resolution. 
-
-#### Settings for IP Webcam (Android)
-Using "Video Preferences", select the widest camera of your device. Set the resolution to be `1920x1080` and video orientation to be "Landscape". You could also enable background streaming in the "Optional Permissions" menu. Finally start the server using "Start Server". You can optionally select "Run in Background" in "Actions" menu which will keep the stream running when the application is put into background. 
-
-#### Settings for IP Camera Lite (iOS / iPadOS)
-In the "Settings" menu go the the "Video overlay" menu and uncheck the "Display Server Timestamp", "Display Camera Name" and "Display Battery Info" options. Delete the username and password in the RTSP settings to disable authentication.
-Then start the the server by clicking "Turn on IP Camera Server". Before starting the reconstruction, disable the "Multi-Cam" option in the "Settings" menu. Set the video resolution to `1920x1080` and choose the widest camera.
-
-#### General Instructions
-You can visit the stream URL at `http://<ip>:<port>/video` (replace `<ip>` and `<port>` with the values shown in the app) on your browser to check the stream and modify any settings if needed. IP Camera Lite adds a watermark to the stream which might affect the reconstruction quality.
-
-### 2. Setting up the Web Viewer
-We provide a simple web viewer for live feedback on the mobile device running the video stream app. 
-To access the web viewer from another machine from the one running the reconstruction you will need to allow access to the TCP ports 6009 and 8000:
-<details>
-<summary><span style="font-weight: bold;">Ubuntu Firewall Settings</span></summary>
-The following command will allow access to the TCP ports 6009 and 8000. 
-<br> 
-Note that different Linux distributions have different firewall management software.
-<pre><code>sudo ufw allow 8000/tcp
-sudo ufw allow 6009/tcp
-sudo ufw enable
-sudo ufw status
-</code></pre>
-If successful, the output should include the following lines:
-<pre><code>8000/tcp                   ALLOW       Anywhere                  
-6009/tcp                   ALLOW       Anywhere                  
-</code></pre>
-</details>
-<details>
-<summary><span style="font-weight: bold;">Fedora Firewall Settings</span></summary>
-The following command will allow access to the TCP ports 6009 and 8000. 
-<br> 
-Note that different Linux distributions have different firewall management software.
-<pre><code>sudo firewall-cmd --add-port 8000/tcp --permanent
-sudo firewall-cmd --add-port 6009/tcp --permanent
-</code></pre>
-</details>
-<details>
-<summary><span style="font-weight: bold;">Windows Firewall Settings</span></summary>
-  <ol>
-    <li>Press <code>Windows + R</code>, type <code>wf.msc</code>, and hit Enter.</li>
-    <li>In the left pane, click <strong>Inbound Rules</strong>.</li>
-    <li>In the right pane, click <strong>New Rule</strong>.</li>
-    <li>Select <strong>Port</strong>, then click <strong>Next</strong>.</li>
-    <li>Select <strong>TCP</strong>, enter <code>6009, 8000</code>, click <strong>Next</strong>.</li>
-    <li>Choose <strong>Allow the connection</strong>, then click <strong>Next</strong>.</li>
-    <li>Check all profiles (<strong>Domain</strong>, <strong>Private</strong>, <strong>Public</strong>), click <strong>Next</strong>.</li>
-    <li>Name the rule (e.g., <code>WebViewer 6009, 8000</code>), then click <strong>Finish</strong>.</li>
-  </ol>
-</details>
-
-On the phone or tablet, open a browser in split screen mode side-by-side (only supported on Android and iPadOS) with the [stream app](#1-setting-up-a-stream). 
-Enter `http://<ip>:8000/webviewer` in the browser, where `<ip>` is the IP address of the computer running the reconstruction server (The page will only load after running the train script). Find the IPv4 address by running `ifconfig` (Ubuntu) or `ipconfig` (Windows) in the command prompt.
-
-### 3. Starting the Reconstruction Server
-Run the reconstruction script with the webviewer mode:
-```bash
-python train.py -s ${STREAM_URL} --downsampling=1.5 --viewer_mode web
-``` 
-> **Note:** We found that setting the stream to 1080p resolution before downsampling by a factor of 1.5 mitigates the impact of compression artifacts.
-
-### 4. Starting the Reconstruction from the Mobile Device
-After the previous steps, the brower on the mobile devide should show the webviewer. Click the "Start" button to start the reconstruction.
-
-<table>
-  <tr width="50%">
-    <td width="60%">
-      <img width="100%" src="assets/android_split.png" />
-      <sup>
-        Live reconstruction on Android using IP Webcam in split screen mode with browser connected to the webviewer.
-      </sup>
-    </td>
-    <td width="40%">
-      <img width="100%" src="assets/ipad_split.jpg" />
-      <sup>
-        Live reconstruction on iPad using IP Camera Lite in split screen mode with browser connected to the webviewer.
-      </sup>
-    </td>
-  </tr>
-</table>
-
-Live 3D reconstruction on Android: the input video stream (left) and the browser-based preview (right) shown in split-screen mode:
-
-
-https://github.com/user-attachments/assets/71e94ae1-012d-417e-b11d-754d07a31772
-
-Live reconstruction monitored with the remote viewer:
-
-https://github.com/user-attachments/assets/f484e3b9-0dfc-48e9-b05d-f0cf30114ad7
-
-## Acknowledgments
-This work was funded by the European Research Council (ERC) Advanced Grant NERPHYS, number 101141721 [https://project.inria.fr/nerphys/](https://project.inria.fr/nerphys). The authors are grateful to the OPAL infrastructure of the Université Côte d'Azur for providing resources and support, as well as Adobe and NVIDIA for software and hardware donations. This work was granted access to the HPC resources of IDRIS under the allocation AD011015561 made by GENCI.
-Bernhard Kerbl has received funding by WWTF (project ICT22-055 - Instant Visualization and Interaction for Large Point Clouds).
-Thanks to Peter Hedman for early comments and suggestions, George Kopanas for proofreading a draft, and Jeffrey Hu for setting up the phone-based capture.

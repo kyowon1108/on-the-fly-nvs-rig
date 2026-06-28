@@ -86,8 +86,8 @@ class PoseInitializer():
                 optimize_3Dpts=False,
                 iters=args.iters_miniba_incr,
             )
-            # Track incremental refinement health. >10% fallback rate is a
-            # signal to investigate BA hyperparameters or matcher quality.
+            # Track incremental refinement health. A non-zero fallback rate is a
+            # signal to inspect MiniBA conditioning and matcher quality.
             self._refine_call_count = 0
             self._refine_fail_count = 0
 
@@ -101,6 +101,7 @@ class PoseInitializer():
             self._recent_steps = []
             self._prev_rig_t = None
             self._rig_huber_trans = float(getattr(args, "rig_huber_trans", 0.05))
+            self._rig_min_success_views = int(getattr(args, "rig_min_success_views", 2))
             self._rig_bootstrap_outlier_dist = float(
                 getattr(args, "rig_bootstrap_outlier_dist", 10.0)
             )
@@ -331,12 +332,12 @@ class PoseInitializer():
 
     @torch.no_grad()
     def initialize_bootstrap_rig(self, desc_kpts_per_ts_per_view, rig_config):
-        """Rig-aware bootstrap for an N-view zero-baseline virtual rig.
+        """N-view zero-baseline virtual rig용 bootstrap.
 
         Args:
-            desc_kpts_per_ts_per_view: list length N_ts of dict
-                {view_name: DescribedKeypoints}. All rig views present per ts.
-            rig_config: RigConfig with fixed relative_Rt per view.
+            desc_kpts_per_ts_per_view: 길이 N_ts의 list. 각 원소는
+                {view_name: DescribedKeypoints}이며 모든 rig view가 들어 있다.
+            rig_config: view별 fixed relative_Rt를 가진 RigConfig.
 
         Returns:
             rig_Rts (N_ts, 4, 4), f, final_residual, xyz_out (npts, 3),
@@ -356,9 +357,9 @@ class PoseInitializer():
         def make_kID(v_idx, ts):
             return ts * N_views + v_idx
 
-        # Time-axis exhaustive matching within each view.
-        # Cross-view matching is intentionally skipped (rotation-only rig has
-        # zero baseline intra-timestep, so cross-view matches carry no depth info).
+        # 같은 view의 time-axis만 exhaustive matching한다. Cross-view same-timestep
+        # matching은 의도적으로 생략한다. Rotation-only rig는 intra-timestep baseline이
+        # 0이라 cross-view match가 depth 정보를 주지 못한다.
         for v_idx, v_name in enumerate(view_names):
             dk_list = per_view_desc_kpts_list[v_name]
             for i in range(N_ts):
@@ -388,10 +389,9 @@ class PoseInitializer():
             hi = (v_idx + 1) * npts_per_view
             uv[lo:hi, :, v_idx, :] = uvs_v
 
-            # Seed xyz from the first valid observation at unit camera-axis depth,
-            # then lift it into the shared rig frame. Monocular depth is still used
-            # later for depth regularization / guided MVS, but bootstrap geometry
-            # stays independent of that prior by default.
+            # 첫 valid observation에서 camera-axis unit depth로 xyz를 seed하고 shared
+            # rig frame으로 lift한다. Monocular depth는 이후 regularization/guided MVS에
+            # 쓰이지만, 기본 bootstrap geometry는 이 prior에 의존하지 않는다.
             valid = (uvs_v >= 0).all(dim=-1)  # (npts_per_view, N_ts)
             for p in range(npts_per_view):
                 ts_hits = valid[p].nonzero(as_tuple=False).flatten()
@@ -400,9 +400,8 @@ class PoseInitializer():
                 ts_idx = int(ts_hits[0].item())
                 uv_pt = uvs_v[p, ts_idx]
                 local = depth2points(uv_pt[None], 1.0, f_init_t, self.centre)[0]
-                # Unit depth ALONG THE CAMERA AXIS (z==depth here) + radial jitter,
-                # applied in camera space before the rig lift. This keeps wide views
-                # on their own viewing ray instead of reflecting them to z<0.
+                # Camera-axis 방향 unit depth(z==depth)와 radial jitter. rig lift 전에
+                # camera space에서 적용해 wide view point가 자기 viewing ray 위에 남게 한다.
                 local = local / local[..., -1:].clamp_min(1e-6)
                 local = local * (1 + torch.randn_like(local[..., :1]).abs())
                 xyz_init[lo + p] = rel_R_all[v_idx].T @ local
@@ -420,9 +419,8 @@ class PoseInitializer():
         self.f = f_out
         self.intrinsics = torch.cat([f_out, self.centre], dim=0)
 
-        # Scale so consecutive rig centers have median distance _scene_scale_target.
-        # Median is robust to a single bad timestep that bootstrap BA might
-        # leave at an outlier position; mean would be dragged by it.
+        # 연속 rig center의 median step을 scene_scale_target에 맞춘다. median은 bootstrap
+        # BA가 만든 단일 outlier timestep에 덜 끌린다.
         rel_rig_t = rig_t_out[:-1] - rig_t_out[1:]
         rel_rig_t_med = rel_rig_t.norm(dim=-1).median()
         scale = self._scene_scale_target / rel_rig_t_med.clamp_min(1e-6)
@@ -476,27 +474,22 @@ class PoseInitializer():
         view_indices,
         rig_config,
     ):
-        """Rig-aware incremental pose from per-view PnP candidates.
+        """Per-view PnP 후보에서 incremental shared rig pose를 추정한다.
 
-        Each view is matched independently against the previous keyframes;
-        per-view 2D-3D correspondences are fed to `rig_pnp_per_view`, which
-        lifts each view's PnP to a rig pose candidate and averages them on
-        SE(3) with an IRLS Huber kernel.
+        각 view는 이전 keyframe 후보와 독립적으로 match한다. View별 2D-3D
+        correspondence를 `rig_pnp_per_view`에 넣으면, 각 view PnP 결과가
+        shared rig pose 후보로 lift되고 SE(3) 위 robust mean으로 합쳐진다.
 
         Args:
-            keyframes: either a flat list of previous Keyframes (all views
-                share the same candidate pool), or a dict
-                {view_name: list[Keyframe]} where each view has its own pool.
-                The dict form is preferred when the camera is turning — each
-                view picks keyframes that best match its own orientation.
+            keyframes: flat list 또는 {view_name: list[Keyframe]}. 회전이 큰
+                rig sequence에서는 view마다 잘 맞는 과거 view가 달라 dict form이 낫다.
             desc_kpts_per_view: dict {view_name: DescribedKeypoints}.
-            view_indices: dict {view_name: int} — kID used by the matcher so
-                that match dicts stay disjoint per view.
-            rig_config: RigConfig with fixed per-view relative Rt.
+            view_indices: matcher의 kID. view별 match dict key가 섞이지 않게 한다.
+            rig_config: view별 fixed relative Rt를 가진 RigConfig.
 
         Returns: (rig_w2c 4x4 Tensor or None, per-view stats dict).
         """
-        # Normalize keyframes argument to a dict.
+        # keyframes 인자를 view별 dict로 normalize한다.
         if isinstance(keyframes, dict):
             keyframes_per_view = keyframes
         else:
@@ -531,17 +524,28 @@ class PoseInitializer():
                 xyz = torch.cat(xyz_list, dim=0)
                 uv = torch.cat(uv_list, dim=0)
                 conf = torch.cat(conf_list, dim=0)
+                finite_mask = (
+                    torch.isfinite(xyz).all(dim=-1)
+                    & torch.isfinite(uv).all(dim=-1)
+                    & torch.isfinite(conf)
+                    & (conf > 0)
+                )
+                xyz = xyz[finite_mask]
+                uv = uv[finite_mask]
+                conf = conf[finite_mask]
                 if len(xyz) > self.num_pts_pnpransac:
-                    # subsample to num_pts_miniba_incr (2000), matching the non-rig
-                    # initialize_incremental path (was pnpransac=4000 → 2x wasted PnP/BA work)
-                    sel = torch.multinomial(conf, self.num_pts_miniba_incr, replacement=False)
+                    # non-rig incremental path와 같은 scale로 subsample한다. 너무 많은
+                    # correspondence는 PnP/BA 비용만 키운다.
+                    sel = torch.multinomial(conf.float(), self.num_pts_miniba_incr, replacement=False)
                     xyz = xyz[sel]
                     uv = uv[sel]
-                correspondences[view_name] = (uv, xyz)
+                    conf = conf[sel]
+                correspondences[view_name] = (uv, xyz, conf)
             else:
                 correspondences[view_name] = (
                     torch.zeros(0, 2, device="cuda"),
                     torch.zeros(0, 3, device="cuda"),
+                    torch.zeros(0, device="cuda"),
                 )
 
         f = self.f.item() if isinstance(self.f, torch.Tensor) else float(self.f)
@@ -556,6 +560,7 @@ class PoseInitializer():
             reproj_error_px=float(self.max_pnp_error),
             scene_scale=self._current_scene_scale(),
             huber_trans=self._rig_huber_trans,
+            min_success_views=self._rig_min_success_views,
         )
 
         if rig_pose is None:
@@ -564,16 +569,15 @@ class PoseInitializer():
                     keyframe.desc_kpts.matches.pop(my_idx, None)
             return None, stats
 
-        # Refine rig_pose with 1-timestep MiniBARig LM (pose-only).
-        # Takes PnP+Fréchet mean output as initial guess, tightens it with
-        # full reprojection residual across all rig views simultaneously.
+        # Refine the PnP+Fréchet mean pose with a one-timestep MiniBARig solve.
+        # If the solve is unstable, keep the PnP pose and record the fallback.
         if hasattr(self, "miniba_incr_rig"):
             self._refine_call_count += 1
             try:
                 rig_pose = self._refine_rig_pose_miniba(rig_pose, correspondences, rig_config)
             except Exception as e:
-                # Refinement is a best-effort tightening; fall back to PnP
-                # result on any numerical hiccup instead of dropping the ts.
+                # A refinement failure should be visible in metadata, but should
+                # not discard an otherwise valid PnP registration.
                 self._refine_fail_count += 1
                 fail_rate = self._refine_fail_count / max(self._refine_call_count, 1)
                 print(
@@ -589,9 +593,8 @@ class PoseInitializer():
     def _refine_rig_pose_miniba(self, rig_pose_init, correspondences, rig_config):
         """1-timestep MiniBARig LM refinement of the rig_pose.
 
-        Layout for MiniBARig (n_ts=1): observation buffer is
-        (npts, n_ts=1, n_views, 2) where `-1` means no observation. We fill
-        each view's strip with that view's correspondences.
+        MiniBARig layout은 `(npts, n_ts=1, n_views, 2)`이며 `-1`은 observation이
+        없다는 뜻이다. 각 view strip에 해당 view의 correspondence를 채운다.
         """
         view_names = list(rig_config.view_names)
         n_views = len(view_names)
@@ -605,7 +608,7 @@ class PoseInitializer():
         for v_idx, v_name in enumerate(view_names):
             if v_name not in correspondences:
                 continue
-            uv_v, xyz_v = correspondences[v_name]
+            uv_v, xyz_v = correspondences[v_name][:2]
             if uv_v.shape[0] == 0:
                 continue
             n = min(pts_per_view, uv_v.shape[0])
@@ -636,15 +639,12 @@ class PoseInitializer():
             uv.reshape(-1).contiguous(),
         )
 
-        # Sanity: if output has NaNs, or if refinement moved the translation
-        # by an unreasonable amount relative to the PnP initial (e.g. MiniBA
-        # diverged on degenerate inputs), keep the PnP result.
+        # Reject non-finite or scene-scale-inconsistent refinement updates.
         if not torch.isfinite(t_out).all() or not torch.isfinite(R6D_out).all():
             return rig_pose_init
         t_jump = float((t_out[0] - t_init).norm().item())
-        # Bound the BA correction to a few inter-frame steps (running scene_scale),
-        # not the absolute |t_init| which grows with orbit radius / distance from the
-        # world origin and would effectively disable this backstop far from origin.
+        # Bound the correction by the running step scale, not distance from the
+        # world origin, so long trajectories keep the same stability gate.
         max_jump = max(0.2, 3.0 * self._current_scene_scale())
         if t_jump > max_jump:
             return rig_pose_init

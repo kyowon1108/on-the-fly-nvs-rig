@@ -14,6 +14,7 @@ import time
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from tqdm import tqdm
 
 from socketserver import TCPServer
@@ -142,10 +143,25 @@ if __name__ == "__main__":
     depth_estimator = MonoDepthEstimator(width, height)
     scene_model = SceneModel(width, height, args, matcher)
     if args.use_rig:
-        # N-view-aware active window: tell scene_model how many views per timestep
-        # so n_kept_frames scales as n_kept_timesteps * N (6/9/12/15-view rigs).
+        # Rig 단위는 image가 아니라 timestep packet이다. SceneModel에는 N을
+        # 알려서 active window가 `n_kept_timesteps * N` frame으로 잡히게 한다.
         scene_model.set_rig_view_count(len(dataset.rig.view_names))
         scene_model.set_rig_expected_timesteps(dataset.get_expected_timestep_splits())
+        split_policy = (
+            "ob3d_timestep_packet_split"
+            if getattr(args, "rig_train_timesteps_file", "")
+            else "timestep_packet_holdout"
+            if getattr(args, "rig_test_timesteps_file", "")
+            else "diagnostic_view_holdout"
+            if getattr(args, "rig_holdout_view", "")
+            else "no_holdout"
+        )
+        scene_model.rig_policy.update({
+            "split_policy": split_policy,
+            "pose_policy": "pose_assisted_online_all_registered_frames",
+            "radiance_policy": "Gaussian spawn and photometric optimization use rig_eval_split == 'train' only",
+            "metric_policy": "claim NVS metrics use rig_eval_split == 'test' only",
+        })
     detector = Detector(args.num_kpts, width, height)
 
     # Initialize the viewer
@@ -171,8 +187,8 @@ if __name__ == "__main__":
     needs_reboot = False
     bootstrap_keyframe_dicts = []
     bootstrap_desc_kpts = []
-    # Rig mode: one N-view batch per timestep. The first B batches accumulate
-    # for bootstrap; each later packet is registered incrementally.
+    # Rig mode: loop 1회가 ref-first N-view packet 1개다. 처음 B개 packet은
+    # bootstrap에 모으고, 이후 packet은 shared rig pose 하나씩 incremental 등록한다.
     bootstrap_rig_data = []
     n_rig_bootstrap_ts = 0
 
@@ -183,8 +199,7 @@ if __name__ == "__main__":
 
     ## Scene reconstruction
     print(f"Starting reconstruction for {args.source_path}")
-    # In rig mode each loop iteration consumes N images (one full rig batch),
-    # so the tqdm range must be in batches rather than individual images.
+    # Rig mode에서는 loop iteration이 image 수가 아니라 timestep 수다.
     total_iters = (
         dataset.num_timesteps if args.use_rig else len(dataset)
     )
@@ -208,7 +223,7 @@ if __name__ == "__main__":
                 viewer.trainer_state = "finish"
                 break
         
-        # === Rig mode: one N-view batch per timestep ===
+        # === Rig mode: 한 timestep의 N-view packet을 한 번에 소비 ===
         if args.use_rig:
             image, info = dataset.getnext()
             if info["rig_view"] != dataset.ref_view:
@@ -253,7 +268,7 @@ if __name__ == "__main__":
                 if n_rig_bootstrap_ts < B:
                     continue
 
-                # --- Rig bootstrap: run MiniBARig over B timesteps * N views ---
+                # --- Rig bootstrap: B timesteps x N views를 한 번에 MiniBARig로 초기화 ---
                 start_time = time.time()
                 desc_per_ts_per_view = [
                     {v: data["frames"][v][2] for v in view_order}
@@ -267,10 +282,9 @@ if __name__ == "__main__":
                 focal = f_out.cpu().item()
                 increment_runtime(runtimes["BAB"], start_time)
 
-                # (rig) Hand the bootstrap rig poses to the photometric optimizer:
-                # it now owns one shared SE(3) rig pose per ts, represented by a
-                # 6D rotation parameter plus a 3D translation. The N view poses
-                # are derived as rel @ rig (rel_t=0) and stay co-centered.
+                # Bootstrap 결과를 photometric optimizer가 소유하는 shared rig pose로
+                # 넘긴다. 각 slot은 SE(3) pose 하나이며 raw parameter는 6D rotation
+                # + 3D translation이다. View pose는 `rel @ rig`로 파생된다.
                 rig_R6D_init = mtx2sixD(rig_Rts[:, :3, :3].contiguous())
                 rig_t_init = rig_Rts[:, :3, 3].contiguous()
                 scene_model.register_rig_poses(rig_R6D_init, rig_t_init, lr=args.lr_poses)
@@ -284,8 +298,8 @@ if __name__ == "__main__":
                         img, inf, desc = data["frames"][v_name]
                         rel = inf["rig_relative_Rt"].to("cuda")
                         Rt_view = rel @ rig_pose
-                        # (rig) tag info so Keyframe takes the rig branch: its pose is
-                        # derived from scene_model.rig_R6D[ts_idx], not a free param.
+                        # `ts_idx`는 optimizer slot이다. Keyframe은 이 값을 통해
+                        # 자유 pose parameter 대신 shared rig pose를 참조한다.
                         inf["ts_idx"] = ts_i
                         inf["rig_view"] = v_name
                         kf = Keyframe(
@@ -300,12 +314,9 @@ if __name__ == "__main__":
                         n_keyframes += 1
                 increment_runtime(runtimes["Add"], start_time)
 
-                # Gaussian initialization from all N views (was: ref only).
-                # Each view's desc_kpts.pts3d is filled in by update_3dpts()
-                # inside add_new_gaussians via its own time-axis matches that
-                # bootstrap_rig has already generated. add_new_gaussians also
-                # handles align_depth internally, so the explicit non-ref
-                # align_depth loop is no longer needed.
+                # Gaussian 초기화는 ref view 하나가 아니라 packet의 모든 view에서 만든다.
+                # 각 view는 bootstrap time-axis match로 3D point를 채우고, packet 전체를
+                # plan한 뒤 한 번 commit한다.
                 start_time = time.time()
                 first_bootstrap_scene_idx = (
                     len(scene_model.keyframes)
@@ -333,20 +344,13 @@ if __name__ == "__main__":
                     viewer.reset_intrinsics("point_view")
                 continue
 
-            # --- Rig-incremental (post-bootstrap) ---
+            # --- Rig incremental (post-bootstrap) ---
             start_time = time.time()
             view_indices = {v: n_keyframes + i for i, v in enumerate(view_order)}
             desc_per_view = {v: rig_batch[v][2] for v in view_order}
-            # Per-view prev_keyframes: each view picks its own candidate pool
-            # based on its own features. Critical for U-turn handling, where
-            # a single view's best prev frames are very different from ref's.
-            # update_3dpts=True only on the first call to avoid redundant
-            # triangulation across the N per-view queries.
-            # update_3dpts=False for ALL views, then refresh each unique prev keyframe
-            # exactly once. The per-view pools diverge (each view picks its own best
-            # matches), so refreshing only the first view's pool
-            # left views 1..N-1 doing PnP against STALE 3D points -> incremental drift,
-            # worst exactly when the camera turns and pools diverge most.
+            # 각 view는 자기 feature에 맞는 과거 keyframe pool을 따로 고른다. 카메라가
+            # 크게 회전하면 ref view의 후보가 다른 view에는 나쁠 수 있다. 후보 pool을
+            # 먼저 모은 뒤 unique prev keyframe만 한 번씩 3D point를 refresh한다.
             prev_per_view = {}
             target_centre = scene_model._live_centres_for_keyframe_ids(
                 [len(scene_model.keyframes) - 1]
@@ -366,10 +370,16 @@ if __name__ == "__main__":
             increment_runtime(runtimes["tri"], start_time)
 
             start_time = time.time()
-            rig_pose, _ = pose_initializer.initialize_incremental_rig(
+            rig_pose, rig_pnp_stats = pose_initializer.initialize_incremental_rig(
                 prev_per_view, desc_per_view, view_indices, dataset.rig,
             )
             increment_runtime(runtimes["BAI"], start_time)
+            scene_model.extra_metadata.setdefault("rig_pnp_per_timestep", []).append({
+                "source_ts": int(ts),
+                "stream_idx": int(stream_idx),
+                "split": info.get("rig_eval_split", "tracking"),
+                "stats": rig_pnp_stats,
+            })
             if rig_pose is None:
                 scene_model.record_rig_timestep_failure(
                     source_ts=ts,
@@ -379,8 +389,8 @@ if __name__ == "__main__":
                 )
                 continue
 
-            # (rig) Append this ts's rig pose as a new optimizer slot (moments of
-            # earlier ts preserved); all N views of this ts derive from it.
+            # 새 timestep의 shared rig pose를 optimizer slot 하나로 추가한다.
+            # 이후 N개 view는 모두 이 slot(`new_ts_idx`)에서 pose를 파생한다.
             new_R6D = mtx2sixD(rig_pose[:3, :3][None].contiguous())[0]
             new_t = rig_pose[:3, 3].contiguous()
             scene_model.append_rig_pose(new_R6D, new_t)
@@ -402,11 +412,9 @@ if __name__ == "__main__":
                 scene_model.add_keyframe(kf)
                 new_scene_indices.append(len(scene_model.keyframes) - 1)
                 n_keyframes += 1
-            # Rig timestamp packet semantics: all N views are registered before
-            # spawn planning, and the Gaussian optimizer mutation is committed
-            # once after planning. This prevents later views from seeing an
-            # already-mutated scene state; stochastic proposal order is not
-            # treated as bitwise invariant.
+            # Timestep packet invariant: N개 view를 모두 등록한 뒤 spawn plan을 만들고,
+            # Gaussian optimizer mutation은 한 번만 commit한다. 그래서 같은 packet 안의
+            # later view가 already-mutated scene을 보는 일을 막는다.
             scene_model.add_new_gaussians_for_keyframes(new_scene_indices)
             increment_runtime(runtimes["Add"], start_time)
             start_time = time.time()
@@ -627,11 +635,10 @@ if __name__ == "__main__":
     scene_model.enable_inference_mode()
 
     # === Post-hoc render evaluation (all keyframes) =========================
-    # Rig eval uses a post-hoc split instead of non-rig test_hold: render each
-    # keyframe from its own pose, compare against the loaded GT, and dump
-    # per-frame metrics so train-view and holdout-view scores can be separated.
-    # Backward is never called here → bypasses the iter≥10 CUDA rasterizer
-    # crash and works with iter=2 baseline.
+    # Rig eval is split after registration: render each registered keyframe from
+    # its own pose, compare against GT RGB, and write separate train/test/
+    # tracking metrics. This pass is no-grad and never feeds metric frames back
+    # into Gaussian optimization.
     if getattr(args, "use_rig", False):
         import cv2
         import numpy as np
@@ -645,18 +652,51 @@ if __name__ == "__main__":
         eval_dir = os.path.join(args.model_path, "render_eval")
         os.makedirs(eval_dir, exist_ok=True)
         per_frame = []
+        skipped_frames = []
+        mask_applied_count = 0
         with torch.no_grad():
             for kf in scene_model.keyframes:
                 pkg = scene_model.render_from_id(kf.index, pyr_lvl=0)
                 rendered = pkg["render"].clamp(0, 1)
                 gt = kf.get_eval_image().to(rendered.device)
                 if gt.shape[-2:] != rendered.shape[-2:]:
+                    skipped_frames.append({
+                        "name": kf.info.get("name", f"kf{kf.index:04d}"),
+                        "source_ts": int(kf.info["source_ts"]),
+                        "rig_view": kf.info.get("rig_view"),
+                        "rig_eval_split": kf.info.get("rig_eval_split", "unknown"),
+                        "reason": "render_gt_shape_mismatch",
+                        "render_shape": list(rendered.shape),
+                        "gt_shape": list(gt.shape),
+                    })
                     continue
-                p = float(psnr_fn(rendered, gt))
-                s = float(fused_ssim(rendered[None], gt[None], train=False).item())
+                metric_rendered = rendered
+                metric_gt = gt
+                mask = kf.get_eval_mask()
+                mask_applied = False
+                metric_mask = None
+                if mask is not None:
+                    mask = mask.to(rendered.device).float()
+                    if mask.shape[-2:] != rendered.shape[-2:]:
+                        mask = F.interpolate(
+                            mask[None],
+                            size=rendered.shape[-2:],
+                            mode="nearest",
+                        )[0]
+                    mask = (mask > 0.5).expand_as(rendered)
+                    metric_rendered = rendered * mask
+                    metric_gt = gt * mask
+                    metric_mask = mask
+                    mask_applied = True
+                    mask_applied_count += 1
+                if metric_mask is not None and metric_mask.any():
+                    p = float(psnr_fn(metric_rendered[metric_mask], metric_gt[metric_mask]))
+                else:
+                    p = float(psnr_fn(metric_rendered, metric_gt))
+                s = float(fused_ssim(metric_rendered[None], metric_gt[None], train=False).item())
                 if lpips_fn is not None:
-                    r01 = rendered[None] * 2 - 1
-                    g01 = gt[None] * 2 - 1
+                    r01 = metric_rendered[None] * 2 - 1
+                    g01 = metric_gt[None] * 2 - 1
                     l = float(lpips_fn(r01, g01).item())
                 else:
                     l = float("nan")
@@ -677,6 +717,7 @@ if __name__ == "__main__":
                         "test" if kf.info.get("is_test", False) else "train",
                     ),
                     "is_test": bool(kf.info.get("is_test", False)),
+                    "mask_applied": mask_applied,
                     "psnr": p, "ssim": s, "lpips": l,
                 })
         if per_frame:
@@ -690,7 +731,10 @@ if __name__ == "__main__":
                 "lpips_mean": (float(np.mean(lpipss)) if lpipss else float("nan")),
                 "psnr_min": float(np.min(psnrs)),
                 "psnr_max": float(np.max(psnrs)),
+                "skipped_count": len(skipped_frames),
+                "mask_applied_frames": int(mask_applied_count),
             }
+            rig_policy = dict(scene_model.rig_policy)
             split_meta = {
                 "mode": (
                     "ob3d"
@@ -702,6 +746,22 @@ if __name__ == "__main__":
                 "rig_holdout_view": getattr(args, "rig_holdout_view", ""),
                 "rig_train_timesteps_file": getattr(args, "rig_train_timesteps_file", ""),
                 "rig_test_timesteps_file": getattr(args, "rig_test_timesteps_file", ""),
+                "pose_policy": rig_policy["pose_policy"],
+                "radiance_policy": rig_policy["radiance_policy"],
+                "metric_policy": rig_policy["metric_policy"],
+                "split_policy": rig_policy["split_policy"],
+                "rig_holdout_view_is_diagnostic": bool(getattr(args, "rig_holdout_view", "")),
+                "claim_grade_split": bool(
+                    getattr(args, "rig_train_timesteps_file", "")
+                    and getattr(args, "rig_test_timesteps_file", "")
+                ),
+                "mask_policy": {
+                    "masks_dir": getattr(args, "masks_dir", ""),
+                    "mask_requested": bool(getattr(args, "masks_dir", "")),
+                    "mask_applied_frames": int(mask_applied_count),
+                },
+                "skipped_count": len(skipped_frames),
+                "skipped_frames": skipped_frames,
                 "test_timesteps": sorted({
                     int(x["source_ts"]) for x in per_frame
                     if x.get("rig_eval_split") == "test"
@@ -722,7 +782,12 @@ if __name__ == "__main__":
             import json as _json
             with open(os.path.join(eval_dir, "metrics.json"), "w") as _f:
                 _json.dump(
-                    {"summary": summary, "split": split_meta, "per_frame": per_frame},
+                    {
+                        "summary": summary,
+                        "split": split_meta,
+                        "skipped_frames": skipped_frames,
+                        "per_frame": per_frame,
+                    },
                     _f,
                     indent=2,
                 )
@@ -753,6 +818,7 @@ if __name__ == "__main__":
             )
             scene_model.rig_completeness = rig_completeness
             scene_model.extra_metadata["rig_completeness"] = rig_completeness
+            scene_model.extra_metadata["rig_policy"] = rig_policy
             def _summarize_rows(rows):
                 if not rows:
                     return {
@@ -772,12 +838,52 @@ if __name__ == "__main__":
                     "lpips_mean": (float(np.mean(rl)) if rl else float("nan")),
                 }
 
+            skipped_test_count = sum(
+                1 for row in skipped_frames if row.get("rig_eval_split") == "test"
+            )
+            expected_test_ts = rig_completeness.get("expected_timesteps_test", [])
+            if split_meta["mode"] == "view":
+                expected_test_frames = len(expected_test_ts) * max(len(split_meta["test_views"]), 1)
+            else:
+                expected_test_frames = len(expected_test_ts) * len(dataset.rig.view_names)
+            claim_metric_warnings = []
+            if skipped_test_count:
+                claim_metric_warnings.append(
+                    f"{skipped_test_count} test frames were skipped during post-hoc metric"
+                )
+            if len(test_pf) != expected_test_frames:
+                claim_metric_warnings.append(
+                    f"rendered test frames {len(test_pf)} != expected {expected_test_frames}"
+                )
+            if rig_completeness.get("missing_timesteps_test"):
+                claim_metric_warnings.append(
+                    "registered test timesteps are missing from the trajectory"
+                )
+            claim_metric_complete = not claim_metric_warnings
+            test_summary = _summarize_rows(test_pf)
+            test_summary.update({
+                "pose_policy": rig_policy["pose_policy"],
+                "radiance_policy": rig_policy["radiance_policy"],
+                "metric_policy": rig_policy["metric_policy"],
+                "split_policy": rig_policy["split_policy"],
+                "mask_policy": split_meta["mask_policy"],
+                "skipped_count": len(skipped_frames),
+                "skipped_test_count": int(skipped_test_count),
+                "expected_test_frames": int(expected_test_frames),
+                "claim_metric_complete": bool(claim_metric_complete),
+                "claim_metric_warnings": claim_metric_warnings,
+            })
             split_metrics = {
-                "all": summary,
-                "test": _summarize_rows(test_pf),
+                "all": {**summary, **rig_policy, "mask_policy": split_meta["mask_policy"]},
+                "test": test_summary,
                 "train": _summarize_rows(train_pf),
                 "tracking": _summarize_rows(tracking_pf),
                 "split": split_meta,
+                "policy": rig_policy,
+                "skipped_frames": skipped_frames,
+                "skipped_count": len(skipped_frames),
+                "skipped_test_count": int(skipped_test_count),
+                "claim_metric_complete": bool(claim_metric_complete),
                 "rig_leakage_audit": dict(scene_model.rig_leakage_audit),
                 "rig_completeness": rig_completeness,
             }
@@ -799,6 +905,9 @@ if __name__ == "__main__":
                         "summary": summary,
                         "test_summary": split_metrics["test"],
                         "train_summary": split_metrics["train"],
+                        "policy": rig_policy,
+                        "claim_metric_complete": bool(claim_metric_complete),
+                        "skipped_frames": skipped_frames,
                         "rig_leakage_audit": split_metrics["rig_leakage_audit"],
                         "rig_completeness": rig_completeness,
                         "split": split_meta,

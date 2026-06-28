@@ -1,11 +1,10 @@
-"""Rig-aware image dataset for an N-view zero-baseline virtual rig.
+"""N-view zero-baseline virtual rig용 image dataset.
 
-Each timestep emits one interleaved N-view batch: the reference view first, then
-the remaining non-ref views in the order they appear in `rig_config.view_names`.
-The training loop pulls a whole timestep at once and estimates a single shared
-rig pose for it; each frame carries its fixed `rig_relative_Rt` in `info`, and
-per-view poses are derived as rel @ rig (no independent per-view pose, rel_t=0).
-`start_at` is in timestep units (not per-image).
+한 source timestep은 ref view를 먼저, 나머지 view를 `rig_config.view_names`
+순서대로 내보내는 N-view packet이다. Train loop는 이 packet 전체를 한 번에
+소비하고 shared rig pose 하나를 추정한다. 각 frame은 고정 `rig_relative_Rt`를
+`info`에 싣고, view pose는 `view_w2c = rel @ rig_w2c`로 파생된다
+(per-view free pose 없음, `rel_t=0`). `start_at`은 image가 아니라 timestep 단위다.
 """
 
 import json
@@ -25,16 +24,15 @@ from utils import get_image_names
 
 
 def _frame_key(view: str, ts: int) -> str:
-    # Unique key used both as `info["name"]` and as the dict key in `self.infos`.
+    # `info["name"]`와 `self.infos` key 모두에 쓰는 view-level 고유 이름.
     return f"{view}__ts{ts:05d}"
 
 
 def _parse_timestep_token(token: str) -> int:
-    """Parse an OB3D split token into the original integer frame index.
+    """OB3D split token을 원본 EQR frame index(`source_ts`)로 파싱한다.
 
-    OB3D split files use bare integers (e.g. `2`), while local tooling often
-    names prepared pinholes as `frame_000002.png`. Accept both so the split
-    manifest can stay close to the source dataset or to the prepared rig tree.
+    OB3D split file은 `2` 같은 정수를 쓰고, 준비된 pinhole tree는 보통
+    `frame_000002.png`를 쓴다. 둘 다 같은 `source_ts=2`로 해석한다.
     """
     token = token.strip()
     if not token:
@@ -69,11 +67,11 @@ def _load_timestep_split(path: str, valid_timesteps: set[int]) -> set[int]:
 
 
 def _build_timestep_records(names, start_at: int = 0) -> list[dict]:
-    """Return source timestep semantics for a sorted online stream.
+    """정렬된 online stream에서 `source_ts`와 `stream_idx`를 분리한다.
 
-    `source_ts` is the original EQR frame id parsed from the filename and is
-    used for splits, ATE, and reporting. `stream_idx` is only the rank in the
-    online stream after `start_at` trimming; it is never a pose-optimizer slot.
+    `source_ts`는 filename에서 파싱한 원본 EQR frame id이며 split, ATE, 보고서에
+    사용한다. `stream_idx`는 `start_at` 이후 online stream 순서일 뿐이고,
+    pose optimizer slot이 아니다.
     """
     timestep_names = sorted(names)
     if not timestep_names:
@@ -127,9 +125,8 @@ class RigImageDataset:
                 )
             self.masks_root = masks_root
 
-        # Auto-load focal from the extraction step's metadata so a forgotten
-        # --init_fov can't silently produce a wrong reconstruction. The
-        # extraction script (eqr_to_pinhole.py) is the source of truth.
+        # Auto-load focal from extraction metadata so rig crops use the same
+        # intrinsics they were rendered with.
         meta_path = os.path.join(args.source_path, "extraction_meta.json")
         if os.path.exists(meta_path) and args.init_focal < 0 and args.init_fov < 0:
             with open(meta_path) as f:
@@ -140,10 +137,8 @@ class RigImageDataset:
                 f"from {meta_path}"
             )
         elif not os.path.exists(meta_path) and args.init_focal < 0 and args.init_fov < 0:
-            # Without extraction_meta.json the focal can only fall back to
-            # 0.7*width, which for the OB3D-rig pinhole crop is wildly wrong and
-            # silently corrupts the reconstruction. Force the user to pass the
-            # known intrinsic explicitly rather than guessing.
+            # Without extraction_meta.json, the generic 0.7*width fallback is not
+            # tied to the rig crop FOV. Require explicit intrinsics instead.
             raise FileNotFoundError(
                 f"[rig] no extraction_meta.json at {meta_path} and neither "
                 "--init_focal nor --init_fov was given. Pass the pinhole focal "
@@ -151,12 +146,12 @@ class RigImageDataset:
                 "the 0.7*width fallback is not valid for the rig crop."
             )
 
-        # Load rig geometry (relative Rt per view, in COLMAP world-to-camera convention).
+        # Rig geometry: view별 fixed relative Rt, COLMAP world-to-camera convention.
         self.rig = load_rig_config(args.rig_config, ref_view=args.ref_view, device="cpu")
         self.ref_view = self.rig.ref_view
         self.non_ref_views = [v for v in self.rig.view_names if v != self.ref_view]
 
-        # Scan per-view frame files and derive the common timestep list.
+        # 모든 view에 공통으로 존재하는 frame만 timestep packet으로 인정한다.
         self.frames_per_view: Dict[str, List[str]] = {}
         for view in self.rig.view_names:
             view_dir = os.path.join(self.images_root, view)
@@ -175,8 +170,8 @@ class RigImageDataset:
         }
         self.num_timesteps = len(self.timestep_names)
 
-        # Iteration order: every timestep emits a full N-view batch, ref first,
-        # non-ref in fixed rig order. train.py consumes the whole batch together.
+        # Iteration order: source timestep마다 full N-view packet을 낸다.
+        # 항상 ref first, 이후 non-ref는 fixed rig order. train.py는 이 packet을 함께 소비한다.
         self.items: List[dict] = []
         for record in self.timestep_records:
             fname = record["filename"]
@@ -192,14 +187,13 @@ class RigImageDataset:
                                    "path": os.path.join(self.images_root, view, fname),
                                    "filename": fname})
 
-        # Per-item metadata consumed by the training loop.
-        # is_test marks held-out frames so add_new_gaussians and the scene loss
-        # skip them, while the online stream still estimates their poses. Two
-        # holdout modes exist:
-        #   1) rig_holdout_view: one direction across all timesteps (diagnostic)
-        #   2) rig_test_timesteps_file: all N views for held-out EQR timesteps
-        #   3) rig_train_timesteps_file + rig_test_timesteps_file: OB3D-style
-        #      train/test split; remaining timesteps are tracking-only.
+        # Training loop이 소비하는 per-item metadata.
+        # `is_test=True`는 pose tracking은 허용하지만 Gaussian spawn/loss는 제외한다는 뜻이다.
+        # holdout mode:
+        #   1) rig_holdout_view: 모든 timestep의 특정 방향만 holdout (diagnostic)
+        #   2) rig_test_timesteps_file: held-out EQR timestep의 N개 view 전체
+        #   3) rig_train_timesteps_file + rig_test_timesteps_file: OB3D claim split.
+        #      train/test 밖 timestep은 tracking-only다.
         holdout_view = (getattr(args, "rig_holdout_view", "") or "").strip()
         if holdout_view and holdout_view not in self.rig.view_names:
             raise ValueError(
@@ -263,10 +257,9 @@ class RigImageDataset:
             else:
                 eval_split = "train"
             self.infos[key] = {
-                # Historical bool consumed by SceneModel as an optimization gate.
-                # In OB3D train/test mode, tracking-only frames are also excluded
-                # from Gaussian/loss updates, so they are True here but are NOT
-                # counted as test metrics (`rig_eval_split == "tracking"`).
+                # 기존 SceneModel gate와 호환되는 bool. OB3D mode에서 tracking-only도
+                # Gaussian/loss에서 제외되므로 True지만, test metric에는 들어가지 않는다.
+                # Claim metric은 반드시 `rig_eval_split == "test"`만 사용한다.
                 "is_test": (eval_split != "train"),
                 "name": key,
                 "rig_view": item["view"],
@@ -274,9 +267,8 @@ class RigImageDataset:
                 "stream_idx": item["stream_idx"],
                 "rig_eval_split": eval_split,
                 "rig_filename": item["filename"],
-                # Kept for long-sequence memory compaction: cold keyframes may
-                # drop their dense RGB cache and reload the source image only
-                # for post-hoc evaluation / visualization.
+                # long sequence compacting용: cold keyframe은 dense RGB cache를 버리고,
+                # post-hoc eval/visualization 때 원본 image를 다시 읽는다.
                 "image_path": item["path"],
                 "rig_relative_Rt": self.rig.relative_Rt[item["view"]].clone(),
             }
@@ -313,7 +305,7 @@ class RigImageDataset:
         return self.height, self.width
 
     def get_expected_timestep_splits(self) -> dict[str, list[int]]:
-        """Return source-timestep universes for completeness accounting."""
+        """Completeness accounting에 쓸 split별 source timestep universe."""
         all_ts = sorted({record["source_ts"] for record in self.timestep_records})
         if self.train_timesteps and self.test_timesteps:
             train_ts = sorted(self.train_timesteps)
@@ -324,8 +316,8 @@ class RigImageDataset:
             train_ts = sorted(set(all_ts) - self.test_timesteps)
             tracking_ts = []
         elif self.holdout_view:
-            # View-holdout is diagnostic: every timestep has both train views
-            # and one held-out direction, so the timestep universe overlaps.
+            # View-holdout은 diagnostic이다. 같은 timestep 안에 train view와 held-out
+            # direction이 공존하므로 train/test timestep universe가 겹친다.
             train_ts = all_ts
             test_ts = all_ts
             tracking_ts = []
@@ -345,23 +337,20 @@ class RigImageDataset:
         item = self.items[index]
         image = self._load_image(item["path"], cv2.IMREAD_UNCHANGED)
         key = _frame_key(item["view"], item["source_ts"])
-        # Return a shallow copy so per-frame mutations (mask, ts_idx set later by
-        # train.py) don't accumulate on the shared self.infos[key] dict.
+        # Shallow copy: train.py가 `ts_idx` 등을 붙여도 shared self.infos[key]에는
+        # 누적되지 않게 한다.
         info = dict(self.infos[key])
         if image.shape[0] == 4:
             info["mask"] = image[-1][None].cpu()
             image = image[:3]
         if self.masks_root:
-            info["mask"] = self._load_mask(item["view"], item["filename"])
+            mask_path = self._resolve_mask_path(item["view"], item["filename"])
+            info["mask_path"] = mask_path
+            info["mask"] = self._load_mask_path(mask_path)
         return image.cuda(), info
 
-    def _load_mask(self, view: str, filename: str):
-        """Load the per-view mask matching images/<view>/<filename>, downsampled
-        the same way as the image. Returns a [1, H, W] float tensor in {0,1} on
-        CPU. Raises if no mask file is found (fail-closed: masks were requested).
-        Tries a few naming conventions (the OB3D-rig export uses
-        masks/<view>/<filename>.png, i.e. a doubled extension like
-        frame_000000.png.png)."""
+    def _resolve_mask_path(self, view: str, filename: str) -> str:
+        """Find the mask matching images/<view>/<filename> or fail closed."""
         view_dir = os.path.join(self.masks_root, view)
         stem = os.path.splitext(filename)[0]
         candidates = [
@@ -375,6 +364,10 @@ class RigImageDataset:
                 f"No rig mask found for view={view}, filename={filename}; "
                 f"tried: {candidates}"
             )
+        return mask_path
+
+    def _load_mask_path(self, mask_path: str):
+        """Load a resolved mask path, downsampled exactly like the image."""
         mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
         if mask is None:
             raise FileNotFoundError(f"Rig mask at {mask_path} could not be loaded.")

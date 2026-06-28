@@ -76,10 +76,10 @@ class Keyframe:
         self.info = info
         self.is_test = info["is_test"]
 
-        # Rig mode derives each view pose from the shared timestep pose:
-        # view_w2c = rel @ rig_w2c, with rel_t = 0. The view keyframe does not own
-        # an independent pose parameter; scene_model.rig_optimizer owns the shared
-        # SE(3) rig pose so all N views stay co-centered during optimization.
+        # Rig mode: view pose는 shared timestep pose에서 파생된다.
+        #   view_w2c = rel @ rig_w2c, rel_t = 0
+        # 이 keyframe은 독립 pose parameter를 소유하지 않고, `scene_model.rig_optimizer`
+        # 가 shared SE(3) pose를 소유한다.
         self.rig_view = info.get("rig_view", None)
         self.ts_idx = info.get("ts_idx", None)
         if self.rig_view is not None and self.ts_idx is None:
@@ -89,8 +89,8 @@ class Keyframe:
 
         # Optimizable parameters
         if self.is_rig_mode:
-            # Inert tensors: the optimizable pose lives in scene_model. rel_R/rel_t
-            # are the fixed intra-rig extrinsics, with rel_t=0 for this virtual rig.
+            # rW2C/tW2C는 inert tensor다. 최적화되는 pose는 scene_model에 있고,
+            # rel_R/rel_t는 view별 fixed intra-rig extrinsic이다.
             self.rW2C = Rt[:3, :2].clone()
             self.tW2C = Rt[:3, 3].clone()
             self.rel_R = info["rig_relative_Rt"][:3, :3].clone().to("cuda")
@@ -116,8 +116,8 @@ class Keyframe:
                 },
             }
             if not self.is_rig_mode:
-                # rig mode: rW2C/tW2C are inert — the rig pose is optimized by
-                # scene_model.rig_optimizer, so all views move together.
+                # rig mode에서는 rW2C/tW2C를 optimizer에 넣지 않는다. Shared rig pose가
+                # 움직이면 같은 timestep의 모든 view가 함께 움직인다.
                 params["rW2C"] = {"val": self.rW2C, "lr": args.lr_poses}
                 params["tW2C"] = {"val": self.tW2C, "lr": args.lr_poses}
             if not info["is_test"]:
@@ -221,17 +221,44 @@ class Keyframe:
             )
         return torch.from_numpy(image).permute(2, 0, 1).float().cuda() / 255.0
 
+    @torch.no_grad()
+    def get_eval_mask(self):
+        """Return level-0 mask for evaluation, reloading compacted rig masks.
+
+        `is_test=True` can mean metric-test or tracking-only in rig mode, but a
+        mask is purely an image-domain validity map. If the dense cache was
+        released, `mask_path` lets post-hoc metrics use the same mask that was
+        used during training/loss computation.
+        """
+        if self.mask_pyr is not None:
+            return self.mask_pyr[0].float()
+        mask_path = self.info.get("mask_path")
+        if not mask_path:
+            return None
+        mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        if mask is None:
+            raise FileNotFoundError(f"Could not reload compacted keyframe mask: {mask_path}")
+        if mask.shape[0] != self.height or mask.shape[1] != self.width:
+            mask = cv2.resize(
+                mask,
+                (self.width, self.height),
+                interpolation=cv2.INTER_NEAREST,
+            )
+        return torch.from_numpy(mask).float()[None].cuda() / 255.0
+
     def get_R(self):
-        # Rig mode: derive view rotation from the shared rig pose (gradients
-        # flow into scene_model.rig_R6D[ts], so all views rotate together).
+        # Rig mode:
+        #   R_view = R_rel @ R_rig
+        # gradient는 scene_model.rig_R6D[ts_idx]로 흘러 같은 timestep view가 함께 회전한다.
         if self.is_rig_mode and self.scene_model is not None:
             rig_R = sixD2mtx(self.scene_model.rig_R6D[self.ts_idx])
             return self.rel_R @ rig_R
         return sixD2mtx(self.rW2C)
 
     def get_t(self):
-        # Rig mode: view_t = rel_R @ rig_t + rel_t (rel_t == 0). All views of a
-        # timestamp share rig_t → identical optical centre (zero baseline).
+        # Rig mode:
+        #   t_view = R_rel @ t_rig + t_rel,  t_rel = 0
+        # 따라서 같은 timestep의 모든 view center는 `-R_rig.T @ t_rig`로 같다.
         if self.is_rig_mode and self.scene_model is not None:
             rig_t = self.scene_model.rig_t[self.ts_idx]
             return self.rel_R @ rig_t + self.rel_t
@@ -244,8 +271,9 @@ class Keyframe:
         return Rt
 
     def set_Rt(self, Rt: torch.Tensor):
-        # Rig mode: invert view_Rt = rel @ rig_Rt to recover the shared rig pose
-        # and write it back (rig_Rt = rel⁻¹ @ view_Rt), keeping all views rigid.
+        # Rig mode: view_Rt = rel @ rig_Rt를 뒤집어 shared rig pose를 갱신한다.
+        #   rig_Rt = rel^{-1} @ view_Rt
+        # 한 view에서 들어온 보정도 timestep의 shared pose slot에 기록된다.
         if self.is_rig_mode and self.scene_model is not None:
             rel_R_inv = self.rel_R.T
             rig_R = rel_R_inv @ Rt[:3, :3]
@@ -268,7 +296,11 @@ class Keyframe:
     @torch.no_grad()
     def update_3dpts(self, all_keyframes: list[Keyframe], allowed_partner_ids=None):
         """
-        Assign a 3D point to each keypoint in the keyframe based on triangulation and the latest rendered depth. 
+        triangulation과 최신 rendered depth를 사용해 keypoint별 3D point를 갱신한다.
+
+        Rig mode에서는 `allowed_partner_ids`가 train + cross-source-ts keyframe으로
+        제한된다. Persistent match cache에 same-ts/test/tracking match가 남아 있어도
+        Triangulator에 들어가기 전에 차단된다.
         """
         unload_desc_kpts = self.desc_kpts.kpts.device.type == "cpu"
         if unload_desc_kpts:
@@ -426,6 +458,7 @@ class Keyframe:
             "rig_eval_split",
             "rig_filename",
             "image_path",
+            "mask_path",
             "ts_idx",
         ]
         for key in passthrough:

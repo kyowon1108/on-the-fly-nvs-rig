@@ -1,8 +1,8 @@
-"""Load blender_rig.json and convert to COLMAP-style relative world-to-camera transforms.
+"""blender_rig.json을 COLMAP-style relative world-to-camera transform으로 변환한다.
 
-Mirrors the conversion used by eqr_to_pinhole.py so poses stay consistent with
-the extracted pinhole images. Translation is forced to zero — the rig is
-rotation-only (all views share one optical center).
+`eqr_to_pinhole.py`의 view 방향과 같은 convention을 써서 pinhole crop과 pose가
+일치하게 만든다. Translation은 의도적으로 0으로 둔다. 즉 이 rig는 rotation-only
+zero-baseline rig이며, 모든 view가 하나의 optical center를 공유한다.
 """
 
 import json
@@ -36,12 +36,12 @@ def _blender_quat_to_world2cam(q: Tensor) -> Tensor:
 
 @dataclass
 class RigConfig:
-    """Fixed rig geometry, expressed relative to a reference view.
+    """Reference view 기준 fixed rig geometry.
 
-    `relative_Rt[view]` is a 4x4 matrix such that
+    `relative_Rt[view]`는 다음 관계를 만족하는 4x4 matrix다.
         view_world2cam = relative_Rt[view] @ rig_world2cam
-    where `rig_world2cam` is the world-to-camera transform of the reference view
-    (the rig's shared optical center pose).
+    여기서 `rig_world2cam`은 reference view의 world-to-camera transform이며,
+    timestep의 shared optical-center pose로 해석된다.
     """
     view_names: List[str]
     ref_view: str
@@ -53,9 +53,12 @@ class RigConfig:
 
 def load_rig_config(config_path: str, ref_view: str = "High_Cam07",
                     device: str = "cpu") -> RigConfig:
-    """Load blender_rig.json -> RigConfig. Flattens ring->camera order into
-    view_names and builds per-view relative_Rt (4x4 world-to-cam, rel_t=0) such
-    that view_w2c = relative_Rt[view] @ rig_w2c, relative to ref_view."""
+    """blender_rig.json -> RigConfig.
+
+    ring->camera 순서를 `view_names`로 flatten하고, ref_view 기준
+    `relative_Rt`를 만든다. 모든 `rel_t`는 0이며,
+    `view_w2c = relative_Rt[view] @ rig_w2c`가 성립한다.
+    """
     with open(config_path, "r", encoding="utf-8") as f:
         rings = json.load(f)
 
@@ -84,7 +87,7 @@ def load_rig_config(config_path: str, ref_view: str = "High_Cam07",
         rel_R = R_w2c @ ref_R_w2c.T
         Rt = torch.eye(4, dtype=torch.float32, device=device)
         Rt[:3, :3] = rel_R
-        # Translation intentionally zero — rotation-only rig.
+        # Translation은 의도적으로 0: same-timestep stereo baseline을 만들지 않는다.
         relative[name] = Rt
 
     return RigConfig(view_names=order, ref_view=ref_view, relative_Rt=relative)

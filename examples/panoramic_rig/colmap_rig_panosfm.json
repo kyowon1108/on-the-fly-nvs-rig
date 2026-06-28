@@ -1,0 +1,248 @@
+[
+  {
+    "cameras": [
+      {
+        "image_prefix": "E+0_A000/",
+        "camera_model_name": "PINHOLE",
+        "camera_params": [
+          200.0,
+          200.0,
+          200.0,
+          200.0
+        ],
+        "ref_sensor": true
+      },
+      {
+        "image_prefix": "E+35_A045/",
+        "camera_model_name": "PINHOLE",
+        "camera_params": [
+          200.0,
+          200.0,
+          200.0,
+          200.0
+        ],
+        "cam_from_rig_rotation": [
+          0.8811195706053617,
+          -0.27781593346944067,
+          0.36497167621709864,
+          -0.11507512748638382
+        ],
+        "cam_from_rig_translation": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "image_prefix": "E+35_A135/",
+        "camera_model_name": "PINHOLE",
+        "camera_params": [
+          200.0,
+          200.0,
+          200.0,
+          200.0
+        ],
+        "cam_from_rig_rotation": [
+          0.3649716762170987,
+          -0.1150751274863838,
+          0.8811195706053617,
+          -0.2778159334694406
+        ],
+        "cam_from_rig_translation": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "image_prefix": "E+35_A225/",
+        "camera_model_name": "PINHOLE",
+        "camera_params": [
+          200.0,
+          200.0,
+          200.0,
+          200.0
+        ],
+        "cam_from_rig_rotation": [
+          -0.3649716762170986,
+          0.11507512748638356,
+          0.8811195706053617,
+          -0.27781593346944067
+        ],
+        "cam_from_rig_translation": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "image_prefix": "E+35_A315/",
+        "camera_model_name": "PINHOLE",
+        "camera_params": [
+          200.0,
+          200.0,
+          200.0,
+          200.0
+        ],
+        "cam_from_rig_rotation": [
+          0.8811195706053617,
+          -0.2778159334694405,
+          -0.36497167621709886,
+          0.11507512748638368
+        ],
+        "cam_from_rig_translation": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "image_prefix": "E+0_A090/",
+        "camera_model_name": "PINHOLE",
+        "camera_params": [
+          200.0,
+          200.0,
+          200.0,
+          200.0
+        ],
+        "cam_from_rig_rotation": [
+          0.7071067811865475,
+          7.850462293418875e-17,
+          0.7071067811865475,
+          7.850462293418875e-17
+        ],
+        "cam_from_rig_translation": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "image_prefix": "E+0_A180/",
+        "camera_model_name": "PINHOLE",
+        "camera_params": [
+          200.0,
+          200.0,
+          200.0,
+          200.0
+        ],
+        "cam_from_rig_rotation": [
+          2.7755575615628914e-17,
+          -8.326672684688674e-17,
+          1.0,
+          -8.326672684688674e-17
+        ],
+        "cam_from_rig_translation": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "image_prefix": "E+0_A270/",
+        "camera_model_name": "PINHOLE",
+        "camera_params": [
+          200.0,
+          200.0,
+          200.0,
+          200.0
+        ],
+        "cam_from_rig_rotation": [
+          -0.7071067811865475,
+          -7.850462293418875e-17,
+          0.7071067811865477,
+          7.850462293418875e-17
+        ],
+        "cam_from_rig_translation": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "image_prefix": "E-35_A000/",
+        "camera_model_name": "PINHOLE",
+        "camera_params": [
+          200.0,
+          200.0,
+          200.0,
+          200.0
+        ],
+        "cam_from_rig_rotation": [
+          0.9537169507482269,
+          0.3007057995042731,
+          0.0,
+          0.0
+        ],
+        "cam_from_rig_translation": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "image_prefix": "E-35_A090/",
+        "camera_model_name": "PINHOLE",
+        "camera_params": [
+          200.0,
+          200.0,
+          200.0,
+          200.0
+        ],
+        "cam_from_rig_rotation": [
+          0.6743797232066278,
+          0.21263110997159385,
+          0.6743797232066278,
+          0.21263110997159385
+        ],
+        "cam_from_rig_translation": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "image_prefix": "E-35_A180/",
+        "camera_model_name": "PINHOLE",
+        "camera_params": [
+          200.0,
+          200.0,
+          200.0,
+          200.0
+        ],
+        "cam_from_rig_rotation": [
+          8.730758825410501e-17,
+          8.730758825410501e-17,
+          0.9537169507482269,
+          0.3007057995042731
+        ],
+        "cam_from_rig_translation": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "image_prefix": "E-35_A270/",
+        "camera_model_name": "PINHOLE",
+        "camera_params": [
+          200.0,
+          200.0,
+          200.0,
+          200.0
+        ],
+        "cam_from_rig_rotation": [
+          -0.6743797232066278,
+          -0.21263110997159385,
+          0.674379723206628,
+          0.2126311099715939
+        ],
+        "cam_from_rig_translation": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      }
+    ]
+  }
+]

@@ -108,6 +108,8 @@ def _protocol_failures(
     leakage = _extract_leakage_audit(metadata, run_dir)
     completeness = _extract_completeness(metadata, run_dir)
     refinement = _extract_incremental_refinement(metadata)
+    split_metrics = _load_json(eval_dir / "split_metrics.json")
+    claim_test = _load_json(eval_dir / "metrics_claim_test.json")
     if not leakage:
         failures.append("missing rig leakage audit")
     if not completeness:
@@ -161,6 +163,20 @@ def _protocol_failures(
         failures.append(f"missing test metric artifact: {eval_dir / 'metrics_claim_test.json'}")
     if not (eval_dir / "metrics_diagnostic_all.json").exists():
         failures.append(f"missing diagnostic metric: {eval_dir / 'metrics_diagnostic_all.json'}")
+    for key in ("pose_policy", "radiance_policy", "metric_policy", "split_policy"):
+        if key not in claim_test:
+            failures.append(f"metrics_claim_test.json missing policy field: {key}")
+    if fail_on_missing:
+        if int(claim_test.get("skipped_test_count", 0) or 0) != 0:
+            failures.append(
+                "metrics_claim_test.json skipped_test_count must be 0, "
+                f"got {claim_test.get('skipped_test_count')}"
+            )
+        if split_metrics.get("claim_metric_complete") is not True:
+            failures.append(
+                "split_metrics.json claim_metric_complete must be true, "
+                f"warnings={claim_test.get('claim_metric_warnings', [])}"
+            )
 
     summary = {
         "run": str(run_dir),
@@ -168,6 +184,8 @@ def _protocol_failures(
         "leakage_audit": leakage,
         "completeness": completeness,
         "rig_incremental_refinement": refinement,
+        "claim_metric_complete": split_metrics.get("claim_metric_complete"),
+        "skipped_test_count": claim_test.get("skipped_test_count"),
         **spread_stats,
         "metrics_claim_test_exists": (eval_dir / "metrics_claim_test.json").exists(),
         "metrics_diagnostic_all_exists": (eval_dir / "metrics_diagnostic_all.json").exists(),

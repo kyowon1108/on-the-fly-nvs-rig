@@ -212,6 +212,11 @@ def get_args():
                              "candidate disagreeing by >this fraction of a typical "
                              "inter-frame step is down-weighted. Lower = anchor harder to "
                              "the top PnP view; higher = average more views.")
+    parser.add_argument('--rig_min_success_views', type=int, default=2,
+                        help="(rig) Minimum number of virtual views with successful PnP "
+                             "needed to accept one timestep's shared rig pose. Default 2 "
+                             "rejects single-view pose consensus; set to 1 only for "
+                             "explicit emergency diagnostics.")
     parser.add_argument('--rig_bootstrap_outlier_dist', type=float, default=10.0,
                         help="(rig) Bootstrap 3D-point distance prune: drop points whose "
                              "norm exceeds this multiple of the median point distance "

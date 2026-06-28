@@ -52,7 +52,7 @@ class WebViewer:
         while True:
             try:
                 try:
-                    cam_centers = self.scene_model.approx_cam_centres
+                    cam_centers = self.scene_model.approx_cam_centres.clone()
                     cam_centers[:, 1] *= -1  # Flip Y
                     cam_centers[:, 2] *= -1  # Flip Z
                     max_pos = cam_centers.max(0)[0].cpu().numpy().tolist()

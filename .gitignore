@@ -1,4 +1,5 @@
 *.pyc
+__pycache__/
 *egg-info
 .venv/
 build
@@ -7,3 +8,5 @@ Gaussian_Viewer.ini
 .vscode
 data/
 results*
+docs/
+.omc/

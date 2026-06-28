@@ -54,6 +54,7 @@ from utils import (
     psnr,
     rotation_distance,
     sixD2mtx,
+    mtx2sixD,
 )
 from dataloaders.read_write_model import write_model
 
@@ -76,6 +77,11 @@ def _make_rig_protocol_audit() -> dict[str, int]:
         "spawn_count_tracking": 0,
         "spawn_skip_count_test": 0,
         "spawn_skip_count_tracking": 0,
+        "mvs_depth_reject_nonfinite": 0,
+        "mvs_depth_reject_invalid": 0,
+        "spawn_reject_nonfinite_mvs": 0,
+        "spawn_reject_nonfinite_match": 0,
+        "spawn_reject_nonfinite_gaussian": 0,
     })
     return audit
 
@@ -107,16 +113,22 @@ class SceneModel:
         self.anchor_overlap = args.anchor_overlap
         self.use_rig = getattr(args, "use_rig", False)
         self.freeze_rig_poses = getattr(args, "freeze_rig_poses", False)
-        # Rig mode owns one shared SE(3) pose per timestep (6D rotation parameter
-        # plus 3D translation). Each virtual view derives pose as rel @ rig with
-        # rel_t=0, so all views from the same source panorama remain co-centered.
-        # When rig_optimizer is active, get_Rts() bypasses the Rt cache because
-        # the shared poses can change every iteration.
+        # Rig mode는 timestep마다 shared SE(3) pose 하나만 최적화한다.
+        # 각 view pose는 `view_w2c = rel @ rig_w2c`이고 `rel_t=0`이므로
+        # 같은 source panorama에서 나온 모든 view는 optical center를 공유한다.
+        # rig_optimizer가 켜지면 매 iteration pose가 바뀌므로 Rt cache를 쓰지 않는다.
         self.rig_R6D = torch.nn.ParameterList()
         self.rig_t = torch.nn.ParameterList()
         self.rig_optimizer = None
         self.optimization_thread = None
+        self.rig_policy = {
+            "pose_policy": "pose_assisted_online_all_registered_frames",
+            "radiance_policy": "rig_eval_split == 'train'",
+            "metric_policy": "rig_eval_split == 'test'",
+            "split_policy": "timestep_packet_split_for_claim_metrics",
+        }
 
+        self.n_rig_views = 1
         try:
             import sys
 
@@ -139,7 +151,6 @@ class SceneModel:
             # train.py from the rig config. n_kept_frames is then N-view-aware
             # (= n_kept_timesteps * N) instead of a fixed keyframe count, so a 6/12/
             # 15-view rig keeps the same number of recent TIMESTEPS live, not frames.
-            self.n_rig_views = 1
             self.n_kept_timesteps = getattr(args, "n_kept_timesteps", 2)
             self.n_kept_frames = 20  # default until place_anchor_if_needed sets it
             self.use_last_frame_proba = args.use_last_frame_proba
@@ -289,6 +300,59 @@ class SceneModel:
         scene_model.active_sh_degree = metadata["config"]["sh_degree"]
         scene_model.max_sh_degree = metadata["config"]["sh_degree"]
 
+        rig_meta = metadata.get("rig", {})
+        if rig_meta:
+            scene_model.use_rig = True
+            scene_model.n_rig_views = int(rig_meta.get("num_views", scene_model.n_rig_views))
+            scene_model.rig_policy.update(rig_meta.get("policy", {}))
+            shared_poses = rig_meta.get("shared_poses", [])
+            if not shared_poses:
+                poses_by_slot = {}
+                for keyframe_json in metadata.get("keyframes", []):
+                    info = keyframe_json.get("info", {})
+                    if "ts_idx" not in info or "rig_relative_Rt" not in info:
+                        continue
+                    ts_idx = int(info["ts_idx"])
+                    if ts_idx in poses_by_slot:
+                        continue
+                    rel = torch.tensor(
+                        info["rig_relative_Rt"],
+                        device="cuda",
+                        dtype=torch.float32,
+                    )
+                    view_w2c = torch.tensor(
+                        keyframe_json["Rt"],
+                        device="cuda",
+                        dtype=torch.float32,
+                    )
+                    rig_w2c = torch.linalg.inv(rel) @ view_w2c
+                    poses_by_slot[ts_idx] = rig_w2c
+                shared_poses = [
+                    {
+                        "ts_idx": int(ts_idx),
+                        "R": pose[:3, :3].detach().cpu().numpy().tolist(),
+                        "t": pose[:3, 3].detach().cpu().numpy().tolist(),
+                    }
+                    for ts_idx, pose in sorted(poses_by_slot.items())
+                ]
+            if shared_poses:
+                max_slot = max(int(pose["ts_idx"]) for pose in shared_poses)
+                pose_by_slot = {int(pose["ts_idx"]): pose for pose in shared_poses}
+                R6D_params = []
+                t_params = []
+                for ts_idx in range(max_slot + 1):
+                    if ts_idx not in pose_by_slot:
+                        raise RuntimeError(
+                            f"Saved rig scene is missing shared pose slot {ts_idx}"
+                        )
+                    pose = pose_by_slot[ts_idx]
+                    R = torch.tensor(pose["R"], device="cuda", dtype=torch.float32)
+                    t = torch.tensor(pose["t"], device="cuda", dtype=torch.float32)
+                    R6D_params.append(torch.nn.Parameter(mtx2sixD(R[None])[0], requires_grad=False))
+                    t_params.append(torch.nn.Parameter(t, requires_grad=False))
+                scene_model.rig_R6D = torch.nn.ParameterList(R6D_params)
+                scene_model.rig_t = torch.nn.ParameterList(t_params)
+
         # Load anchors
         scene_model.anchors = []
         for i in range(len(metadata["anchors"])):
@@ -304,7 +368,7 @@ class SceneModel:
 
         # Load keyframes
         for i in range(len(metadata["keyframes"])):
-            keyframe = Keyframe.from_json(metadata["keyframes"][i], i, width, height)
+            keyframe = Keyframe.from_json(metadata["keyframes"][i], i, height, width)
             scene_model.add_keyframe(keyframe)
 
         return scene_model
@@ -373,10 +437,9 @@ class SceneModel:
     def rig_triangulation_allowed_ids(self, target_keyframe: Keyframe) -> list[int]:
         """Return split-safe, cross-timestep triangulation partners for a rig keyframe.
 
-        `desc_kpts.matches` is persistent and may contain same-timestep,
-        test/tracking, or temporary ids from online PnP. Count those candidates
-        for diagnostics, but only return valid train partners from a different
-        source timestep.
+        `desc_kpts.matches`는 persistent cache라 same-timestep, test/tracking,
+        online PnP temporary id가 남아 있을 수 있다. Diagnostics count는 남기되,
+        실제 triangulation에는 다른 source timestep의 train partner만 넘긴다.
         """
         return collect_allowed_rig_triangulation_ids(
             self.keyframes,
@@ -407,11 +470,10 @@ class SceneModel:
     def _latest_train_packet_frames(self):
         """Return train keyframes from the latest active rig timestep.
 
-        Upstream OTF's `keyframe_id=-1` fast path means "train the latest
-        image". In rig mode the latest image is only one arbitrary view of the
-        latest timestamp packet, so using -1 gives that view extra gradient
-        budget. The rig unit is the whole timestamp packet; sample uniformly
-        from its train views instead.
+        Upstream OTF의 `keyframe_id=-1` fast path는 "latest image를 train"한다는 뜻이다.
+        Rig mode에서 latest image는 latest timestep packet의 임의 view 하나일 뿐이라,
+        그대로 쓰면 그 view만 gradient budget을 더 받는다. Rig 단위는 full timestep
+        packet이므로 그 안의 train view에서 uniform sampling한다.
         """
         if not self.use_rig:
             return []
@@ -526,23 +588,20 @@ class SceneModel:
                     render_pkg["visibility_filter"], render_pkg["radii"].shape[0]
                 )
 
-                # (rig) ONE shared rig-pose step moves all N views of this
-                # timestep together → rel_t stays exactly 0. Gated on not-is_test
-                # (holdout never perturbs the rig pose) and the freeze flag.
+                # Rig mode: one optimizer step updates the shared pose for this
+                # timestep. Non-train frames are excluded from photometric pose
+                # refinement; rel_t remains the fixed zero-baseline rig offset.
                 if (getattr(keyframe, "is_rig_mode", False)
                         and self.rig_optimizer is not None
                         and not self.freeze_rig_poses):
                     self.rig_optimizer.step()
 
-                # NOTE: raw_scaling.clamp was here but REMOVED.
-                # Clamping scaling created Adam optimizer state mismatch that
-                # paradoxically *caused* the cudaErrorIllegalAddress crash at
-                # iter>=20. Removing it resolved the crash.
+                # Do not clamp raw scaling here. Keep optimizer-owned Gaussian
+                # parameters finite, and bound xyz to a broad scene envelope.
                 raw_xyz = self.gaussian_params["xyz"]["val"]
                 if raw_xyz.numel() > 0:
-                    # Scene is at ~0.1-unit scale; 100 is a generous envelope
-                    # that still prevents means2D from overflowing the
-                    # rasterizer's tile arithmetic.
+                    # The reconstruction is bootstrap-normalized; this envelope
+                    # is intentionally loose and only catches divergent points.
                     raw_xyz.data.clamp_(min=-100.0, max=100.0)
                 # Guard against stray NaNs from numerically unstable updates.
                 for key in ("xyz", "scaling", "rotation", "opacity", "f_dc"):
@@ -624,12 +683,12 @@ class SceneModel:
                 gt_image = keyframe.get_eval_image().cuda()
                 render_pkg = self.render_from_id(keyframe.index, pyr_lvl=0)
                 image = render_pkg["render"]
-                mask = (
-                    keyframe.mask_pyr[0].cuda()
-                    if keyframe.mask_pyr is not None
-                    else torch.ones_like(image[:1] > 0)
-                )
-                mask = mask.expand_as(image)
+                mask = keyframe.get_eval_mask()
+                if mask is None:
+                    mask = torch.ones_like(image[:1] > 0)
+                else:
+                    mask = mask.to(image.device)
+                mask = (mask > 0.5).expand_as(image)
                 image = image * mask
                 gt_image = gt_image * mask
                 metrics["PSNR"] += psnr(image[mask], gt_image[mask])
@@ -816,11 +875,10 @@ class SceneModel:
     def get_live_rig_centres(self):
         """Return one live camera centre per rig timestep.
 
-        In the rotation-only rig, all views in a timestep share the same optical
-        centre:
+        Rotation-only rig에서는 같은 timestep의 모든 view가 같은 center를 갖는다.
             C_view = -(R_rel R_rig)^T (R_rel t_rig) = -R_rig^T t_rig.
-        Computing this once per timestep avoids calling Keyframe.get_centre() for
-        every view/keyframe candidate during neighbour selection.
+        이 값을 timestep별로 한 번만 batch 계산하면 neighbour selection에서
+        Keyframe.get_centre()를 view 후보마다 호출하지 않아도 된다.
         """
         if len(self.rig_R6D) == 0:
             return torch.empty(0, 3, device="cuda")
@@ -834,37 +892,24 @@ class SceneModel:
         """
         Get the n previous keyframes that are the closest to the last
         If desc_kpts is not None, we find the previous keyframes that have the most matches with desc_kpts. The search window is given by self.num_prev_keyframes_check
-        If exclude_ts is not None (rig mode), keyframes sharing that rig timestamp are
-        dropped from the candidate pool *before* selection: the N views of one timestep
-        share the rig's optical center (zero baseline), so using them as triangulation/
-        MVS partners yields degenerate depth (conventions §7). They are the nearest
-        neighbours by camera-center distance, so a post-hoc filter would leave none —
-        the exclusion must happen on the candidate pool.
-        If target_centre is given, neighbours are sorted by distance to THAT live
-        camera centre instead of the cached global sorted_frame_indices (which is
-        keyed to the LAST-added keyframe's *initial* pose). For spawning Gaussians
-        from a non-last keyframe — or any keyframe whose pose moved during
-        photometric optimization — the global order picks the wrong neighbours,
-        causing bootstrap/reboot/non-last-spawn order dependence.
+        Rig mode에서 `exclude_ts`가 있으면 같은 source_ts 후보를 selection 전에
+        제거한다. 같은 timestep의 N개 view는 zero baseline이므로 triangulation/MVS
+        depth를 만들 수 없고, camera-center 거리상 가장 가까워 post-filter로는 늦다.
+        `target_centre`가 주어지면 cached approx pose가 아니라 현재 최적화된 live
+        center 기준으로 다시 정렬한다.
         """
         # Make sure the optimization thread is not running
         self.join_optimization_thread()
 
         if target_centre is not None:
-            # Candidate pool = ALL keyframes; we re-sort by live-centre distance
-            # AFTER the holdout / same-ts filters below, recomputing each
-            # candidate's centre from its CURRENT pose (not approx_cam_centres,
-            # which is keyed to initial poses). Sorting the cached centres would
-            # leave live-target vs stale-candidates — only a half fix.
+            # 전체 keyframe을 후보로 잡은 뒤 train/same-ts filter를 먼저 적용하고,
+            # 살아 있는 현재 pose 기준 center로 다시 정렬한다.
             candidate_idx = torch.arange(len(self.keyframes), dtype=torch.long)
         else:
             candidate_idx = self.sorted_frame_indices
         if self.use_rig:
-            # Holdout/test keyframes must never be triangulation / MVS / PnP
-            # partners: their geometry would leak into the poses & depths of the
-            # training views, inflating the held-out metric. Drop them from the
-            # candidate pool up-front (covers both the incremental PnP selection
-            # and the guided-MVS neighbour selection).
+            # `test`와 `tracking`은 online pose tracking에는 남지만, train geometry의
+            # partner가 되면 held-out metric에 누수가 생긴다. 후보 pool에서 먼저 제거한다.
             keep_train = torch.tensor(
                 [
                     (
@@ -889,11 +934,8 @@ class SceneModel:
             )
             candidate_idx = candidate_idx[keep_dense]
 
-        # (rig) Now that holdout/same-ts candidates are removed, sort the survivors
-        # by distance to the TARGET keyframe's LIVE centre. For rig keyframes the
-        # live centre is view-independent, so compute it in one batched pass per
-        # timestep and index by each candidate's ts_idx instead of calling
-        # Keyframe.get_centre() once per candidate.
+        # train/cross-ts 후보만 남긴 뒤 TARGET live centre 기준으로 정렬한다. Rig keyframe의
+        # center는 view와 무관하므로 timestep별 center를 batch 계산하고 `ts_idx`로 index한다.
         if target_centre is not None and len(candidate_idx) > 0:
             if self.use_rig and len(self.rig_R6D) > 0:
                 centres_ts = self.get_live_rig_centres()
@@ -916,12 +958,8 @@ class SceneModel:
 
         # Look for the previous keyframes with the most matches with desc_kpts (if provided)
         if desc_kpts is not None and len(candidate_idx) >= n:
-            # N-view scaling: the candidate pool is the closest-by-center keyframes, but
-            # for an N-view rig each timestep contributes N keyframes at the SAME center,
-            # so a fixed window only spans ~window/N timesteps and yields ~window/N
-            # same-view candidates per view — starving the per-view match selection and
-            # causing incremental pose drift. Scale the pool by N so each view sees a
-            # mono-equivalent number of same-view keyframes.
+            # N-view rig에서는 timestep 하나가 같은 center의 N개 keyframe을 만든다. window를
+            # 그대로 두면 실제 timestep 범위가 window/N로 줄어들므로 N배 확장한다.
             check_window = self.num_prev_keyframes_check * (self.n_rig_views if self.use_rig else 1)
             n_ckecks = min(check_window, len(candidate_idx))
             keyframes_indices_to_check = candidate_idx[:n_ckecks]
@@ -944,9 +982,8 @@ class SceneModel:
         return prev_keyframes
 
     def get_Rts(self):
-        # (rig) rig_R6D/rig_t are stepped every photometric iteration, so a cached
-        # Rt would carry a stale autograd graph and be numerically out of date.
-        # Recompute from the live shared rig pose each call.
+        # Rig pose는 photometric step마다 바뀐다. cached Rt는 stale graph/value가 되므로
+        # shared rig pose에서 매번 다시 조합한다.
         if self.rig_optimizer is not None:
             return torch.stack([kf.get_Rt() for kf in self.keyframes])
         invalid_ids = torch.where(~self.valid_Rt_cache)[0]
@@ -990,11 +1027,10 @@ class SceneModel:
     def add_new_gaussians_for_keyframes(self, keyframe_ids):
         """Plan all requested keyframes first, then commit once.
 
-        For rig mode this is the timestamp-packet contract: all N views of a
-        timestep see the same pre-spawn Gaussian state, and the optimizer
-        mutation is committed once after planning. This is atomic scene-state
-        mutation, not a bitwise view-order-invariance guarantee for stochastic
-        per-view proposals.
+        Rig mode에서는 이것이 timestep packet contract다. 같은 timestep의 N개 view가
+        모두 같은 pre-spawn Gaussian state를 보고 plan한 뒤, optimizer mutation을
+        한 번만 commit한다. Stochastic proposal의 bitwise view-order invariance까지
+        보장한다는 뜻은 아니다.
         """
         plans = []
         for keyframe_id in keyframe_ids:
@@ -1016,9 +1052,8 @@ class SceneModel:
             keyframe.update_3dpts(self.keyframes)
         keyframe.align_depth()
 
-        # Live camera centre of the TARGET keyframe (from its current pose, not the
-        # cached approx_centre keyed to the initial pose). Used for MVS-neighbour
-        # selection, Gaussian scale, and the huge-Gaussian prune below.
+        # TARGET keyframe의 현재 live center. MVS neighbour 선택, scale 초기화,
+        # huge-Gaussian prune 모두 stale approx centre가 아니라 이 값을 써야 한다.
         cam_centre = keyframe.get_centre().detach()
 
         ## Get the pixel-wise probability to add a Gaussian
@@ -1053,22 +1088,17 @@ class SceneModel:
         sample_mask = torch.rand_like(init_proba) < init_proba - penalty # eq. 3
 
         sampled_uv = self.uv[sample_mask]
-        # The guided-MVS branch needs selected pixels AND enough cross-ts
-        # neighbours. If either is missing we skip ONLY the MVS branch (a CUDA-
-        # launch crash guard: grid_size = ceil(0) = 0) — the triangulated match
-        # Gaussians below are still spawned. mvs_pts/depth/accurate_mask stay
-        # empty and the downstream concatenations remain correct.
+        # guided-MVS는 sample pixel과 충분한 cross-ts neighbour가 모두 필요하다. 하나라도
+        # 없으면 MVS만 스킵하고 match 기반 Gaussian spawn은 유지한다.
         mvs_pts = torch.empty(0, 3, device="cuda")
         depth = torch.empty(0, device="cuda")
         accurate_mask = torch.empty(0, dtype=torch.bool, device="cuda")
         run_mvs = sampled_uv.numel() > 0
         if run_mvs:
             ## Initialize positions
-            # Get the samples' depth with guided stereo matching.
-            # Neighbour selection uses the TARGET keyframe's live centre (not the
-            # global sorted_frame_indices keyed to the last-added keyframe's initial
-            # pose) so spawning from a non-last keyframe — bootstrap, reboot, or any
-            # rig view — picks the geometrically correct MVS partners.
+            # Depth for MVS is allowed only from cross-timestep neighbours. Use
+            # the target live centre so non-last keyframes are sorted by their
+            # current optimized geometry, not by stale insertion order.
             prev_KFs = self.get_prev_keyframes(
                 self.guided_mvs.n_cams + 1, update_3dpts=False,
                 exclude_ts=keyframe.info.get("source_ts"),
@@ -1079,36 +1109,43 @@ class SceneModel:
                 if keyframe.index == prev_keyframe.index:
                     prev_KFs.pop(i)
                     break
-            # (rig) same-ts exclusion safety net: prev_KFs must never share this
-            # keyframe's rig timestamp (zero baseline -> degenerate depth).
+            # Same-source timestep partners have zero baseline. This assert keeps
+            # the MVS path aligned with the rig triangulation policy.
             _ex_ts = keyframe.info.get("source_ts")
             if _ex_ts is not None:
                 same_ts_mvs = sum(p.info.get("source_ts") == _ex_ts for p in prev_KFs)
                 self.rig_leakage_audit["mvs_partner_count_same_ts"] += same_ts_mvs
                 assert same_ts_mvs == 0, \
                     "zero-baseline same-ts keyframe leaked into guided_mvs partners"
-            # guided_mvs' CUDA kernel is compiled for a fixed NUM_CAMS = n_cams and
-            # indexes exactly that many neighbours: passing FEWER reads out of bounds.
-            # If the cross-ts pool is too small, skip only the MVS branch (keep match
-            # Gaussians) rather than discarding the whole keyframe.
+            # guided_mvs expects a fixed number of neighbours. If there are not
+            # enough cross-timestep dense frames, skip only the MVS branch.
             if len(prev_KFs) < self.guided_mvs.n_cams:
                 run_mvs = False
         if run_mvs:
             depth, accurate_mask = self.guided_mvs(sampled_uv, keyframe, prev_KFs)
-            valid_mask = (keyframe.sample_conf(sampled_uv) > 0.5) * (depth > 1e-6)
+            sample_conf = keyframe.sample_conf(sampled_uv)
+            finite_depth = torch.isfinite(depth)
+            finite_conf = torch.isfinite(sample_conf)
+            valid_mask = finite_depth & finite_conf & (sample_conf > 0.5) & (depth > 1e-6)
+            if self.use_rig:
+                self.rig_leakage_audit["mvs_depth_reject_nonfinite"] += int(
+                    (~finite_depth | ~finite_conf).sum().item()
+                )
+                self.rig_leakage_audit["mvs_depth_reject_invalid"] += int(
+                    ((finite_depth & finite_conf) & (depth <= 1e-6)).sum().item()
+                )
             sample_mask[sample_mask.clone()] = valid_mask
             depth = depth[valid_mask]
             sampled_uv = sampled_uv[valid_mask]
             accurate_mask = accurate_mask[valid_mask]
         else:
-            # No MVS samples: zero the pixel mask so all the sample_mask-indexed
-            # ops below become empty (match Gaussians are unaffected).
+            # MVS sample이 없으면 MVS mask만 비워 downstream op를 empty로 만든다.
+            # match 기반 Gaussian은 아래에서 계속 처리한다.
             sample_mask.zero_()
             sampled_uv = sampled_uv[:0]
 
-        # Remove Gaussians that are coarser than the newpoints. In the packet
-        # path this is only a keep-mask plan: committing here would make later
-        # views in the same timestamp see a different scene than earlier views.
+        # Build a pruning plan only. The packet-level caller applies all plans in
+        # one commit so views from the same timestep see the same pre-spawn scene.
         coarse_valid_gs_mask = None
         if len(self.xyz) > 0:
             main_gaussians_map = render_pkg["mainGaussID"]
@@ -1124,7 +1161,13 @@ class SceneModel:
 
         # Check for occlusions
         if rendered_depth is not None:
-            valid_mask = depth < rendered_depth[sample_mask]
+            rendered_depth_samples = rendered_depth[sample_mask]
+            valid_mask = (
+                torch.isfinite(depth)
+                & torch.isfinite(rendered_depth_samples)
+                & (rendered_depth_samples > 1e-6)
+                & (depth < rendered_depth_samples)
+            )
             sample_mask[sample_mask.clone()] = valid_mask
             depth = depth[valid_mask]
             sampled_uv = sampled_uv[valid_mask]
@@ -1134,15 +1177,38 @@ class SceneModel:
         if sampled_uv.shape[0] > 0:
             mvs_pts = depth2points(sampled_uv, depth.unsqueeze(-1), self.f, self.centre)
             mvs_pts = (mvs_pts - keyframe.get_t()) @ keyframe.get_R()
+            finite_mvs = torch.isfinite(mvs_pts).all(dim=-1)
+            if not finite_mvs.all():
+                selected = sample_mask.nonzero(as_tuple=False).flatten()
+                sample_mask[selected[~finite_mvs]] = False
+                if self.use_rig:
+                    self.rig_leakage_audit["spawn_reject_nonfinite_mvs"] += int(
+                        (~finite_mvs).sum().item()
+                    )
+                mvs_pts = mvs_pts[finite_mvs]
+                depth = depth[finite_mvs]
+                sampled_uv = sampled_uv[finite_mvs]
+                accurate_mask = accurate_mask[finite_mvs]
         # Add points from matching (these survive even when MVS was skipped)
-        match_pts = keyframe.desc_kpts.pts3d[keyframe.desc_kpts.has_pt3d]
+        match_has_pt3d = keyframe.desc_kpts.has_pt3d.clone()
+        if match_has_pt3d.any():
+            match_finite = (
+                torch.isfinite(keyframe.desc_kpts.pts3d).all(dim=-1)
+                & torch.isfinite(keyframe.desc_kpts.kpts).all(dim=-1)
+            )
+            if self.use_rig:
+                self.rig_leakage_audit["spawn_reject_nonfinite_match"] += int(
+                    (match_has_pt3d & ~match_finite).sum().item()
+                )
+            match_has_pt3d &= match_finite
+        match_pts = keyframe.desc_kpts.pts3d[match_has_pt3d]
         if mvs_pts.shape[0] == 0 and match_pts.shape[0] == 0:
             return None
         new_pts = torch.cat([mvs_pts, match_pts], dim=0)
 
         ## Initialize Colour
         f_dc = img[:, sample_mask]
-        match_sampler = keyframe.desc_kpts.kpts[keyframe.desc_kpts.has_pt3d]
+        match_sampler = keyframe.desc_kpts.kpts[match_has_pt3d]
         match_sampler = make_torch_sampler(match_sampler, self.width, self.height)
         match_colors = F.grid_sample(
             img[None],
@@ -1191,6 +1257,27 @@ class SceneModel:
         )
         rots = torch.zeros(f_dc.shape[0], 4, device="cuda")
         rots[:, 0] = 1
+
+        finite_gaussian = (
+            torch.isfinite(new_pts).all(dim=-1)
+            & torch.isfinite(f_dc.flatten(start_dim=1)).all(dim=-1)
+            & torch.isfinite(opacities).all(dim=-1)
+            & torch.isfinite(scales).all(dim=-1)
+            & torch.isfinite(rots).all(dim=-1)
+        )
+        if not finite_gaussian.all():
+            if self.use_rig:
+                self.rig_leakage_audit["spawn_reject_nonfinite_gaussian"] += int(
+                    (~finite_gaussian).sum().item()
+                )
+            new_pts = new_pts[finite_gaussian]
+            f_dc = f_dc[finite_gaussian]
+            f_rest = f_rest[finite_gaussian]
+            opacities = opacities[finite_gaussian]
+            scales = scales[finite_gaussian]
+            rots = rots[finite_gaussian]
+        if new_pts.shape[0] == 0:
+            return None
 
         ## Get which Gaussians should be pruned
         if self.xyz.shape[0] > 0:
@@ -1277,10 +1364,9 @@ class SceneModel:
     def move_rand_keyframe_to_cpu(self):
         """Move old active keyframes to CPU memory.
 
-        Non-rig preserves upstream's single-frame eviction. Rig mode evicts an
-        entire old timestamp packet so the dense active set does not contain
-        partial 12-view packets, which would bias guided-MVS and optimization
-        toward whichever views happened to remain resident.
+        Non-rig는 upstream처럼 single-frame eviction을 유지한다. Rig mode는 오래된
+        timestep packet 전체를 내보내서 dense active set이 일부 view만 남긴 partial
+        packet이 되지 않게 한다.
         """
         protected_tail = set(self.active_frames_gpu[-self.n_kept_frames:])
         if self.use_rig:
@@ -1318,10 +1404,13 @@ class SceneModel:
             self.active_frames_cpu.remove(frame_id) 
 
     def register_rig_poses(self, rig_R6D_init, rig_t_init, lr):
-        """(rig) Bootstrap setup. Wrap each per-ts (3,2) rotation + (3,) translation
-        as an nn.Parameter owned by a dedicated rig_optimizer. View poses derive
-        from these as rel @ rig, so the N views of a timestep stay rigidly
-        co-centered (rel_t=0) through photometric optimization."""
+        """(rig) Bootstrap setup.
+
+        timestep별 `(3,2)` rotation parameter와 `(3,)` translation을 dedicated
+        `rig_optimizer`가 소유하는 Parameter로 등록한다. View pose는 `rel @ rig`로
+        파생되므로, 같은 timestep의 N개 view는 photometric optimization 중에도
+        co-centered 상태를 유지한다.
+        """
         from scene.optimizers import BaseAdam
         assert len(self.rig_R6D) == 0, "rig poses already registered"
         params = {}
@@ -1335,8 +1424,11 @@ class SceneModel:
         self.rig_optimizer = BaseAdam(params, betas=(0.8, 0.99))
 
     def append_rig_pose(self, rig_R6D_new, rig_t_new, lr=None):
-        """(rig) Incremental grow. Add one ts slot, registering its params with
-        rig_optimizer while preserving the moments of already-registered ts."""
+        """(rig) Incremental grow.
+
+        새 timestep의 optimizer slot 하나를 추가하되, 기존 timestep parameter의 Adam
+        moment는 보존한다.
+        """
         assert self.rig_optimizer is not None, \
             "register_rig_poses must be called before append_rig_pose"
         p_R = torch.nn.Parameter(rig_R6D_new.clone())
@@ -1355,7 +1447,7 @@ class SceneModel:
         # Make sure training is not running
         self.join_optimization_thread()
 
-        # (rig) attach scene_model back-ref so get_R/get_t use the shared rig pose
+        # rig keyframe은 scene_model back-ref를 통해 shared rig pose를 읽는다.
         if getattr(keyframe, "is_rig_mode", False):
             keyframe.scene_model = self
 
@@ -1442,10 +1534,8 @@ class SceneModel:
         """Check if many Gaussians appear small on the screen. If so, place a new anchor. and merge the Gaussians."""
         small_prop_thresh = 0.4
         k = 3
-        # N-view-aware recent-context window: keep the last n_kept_timesteps full
-        # timesteps (= n_kept_timesteps * N_views keyframes) live, so a 6/9/12/15-
-        # view rig keeps the same number of recent TIMESTEPS, not a fixed frame
-        # count. Non-rig keeps the original 20.
+        # 최근 context도 timestep 기준으로 맞춘다: 최근 n_kept_timesteps개의 full packet
+        # (= n_kept_timesteps * N_views keyframes)을 live로 유지한다.
         self.n_kept_frames = (self.n_kept_timesteps * self.n_rig_views) if self.use_rig else 20
         if (
             self.xyz.shape[0] > 0
@@ -1572,10 +1662,25 @@ class SceneModel:
         }
         if self.use_rig:
             rig_leakage_audit = dict(self.rig_leakage_audit)
+            rig_policy = dict(self.rig_policy)
+            shared_poses = []
+            for ts_idx, (R6D, t) in enumerate(zip(self.rig_R6D, self.rig_t)):
+                R = sixD2mtx(R6D.detach()).detach().cpu().numpy().tolist()
+                t_list = t.detach().cpu().numpy().tolist()
+                shared_poses.append({
+                    "ts_idx": int(ts_idx),
+                    "R": R,
+                    "t": t_list,
+                })
             metadata["rig"] = {
                 "num_timesteps": len(self.rig_R6D),
                 "num_views": self.n_rig_views,
-                "metric_policy": "rig_eval_split == 'test'",
+                "pose_policy": rig_policy["pose_policy"],
+                "radiance_policy": rig_policy["radiance_policy"],
+                "metric_policy": rig_policy["metric_policy"],
+                "split_policy": rig_policy["split_policy"],
+                "policy": rig_policy,
+                "shared_poses": shared_poses,
                 "completeness": getattr(self, "rig_completeness", {}),
                 "split_counts": {
                     split: sum(
@@ -1586,6 +1691,7 @@ class SceneModel:
                 },
                 "leakage_audit": rig_leakage_audit,
             }
+            self.extra_metadata["rig_policy"] = rig_policy
             self.extra_metadata["rig_leakage_audit"] = rig_leakage_audit
             if getattr(self, "rig_completeness", None):
                 self.extra_metadata["rig_completeness"] = self.rig_completeness
