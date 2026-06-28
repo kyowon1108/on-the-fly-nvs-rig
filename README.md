@@ -11,10 +11,9 @@ rotation-only zero-baseline rig로 처리함.
 
 ### 목표
 
-> 360 panorama는 한 번의 physical capture에서 넓은 angular coverage를 주지만,
-> same-timestep stereo baseline은 0임. 이 조건에서 online pose-coupled
-> Gaussian reconstruction이 temporal parallax, shared-pose refinement,
-> depth prior, densification에 얼마나 의존하는지 평가함.
+> OTF-Rig는 On-the-Fly NVS를 360 EQR 기반 zero-baseline virtual panoramic rig로 확장한 fast online reconstruction system임. 
+> 각 EQR timestep은 N개의 virtual pinhole views로 변환되며, 이들은 하나의 shared SE(3) rig pose를 공유함. 
+> 목표는 COLMAP/panorama-SfM-style pose/reconstruction pipeline 대비 빠르거나 비슷한 시간 안에 incremental pose estimation과 Gaussian spawn/densification을 수행하고, competitive NVS quality를 얻는 것임.
 
 ## 현재 환경
 
